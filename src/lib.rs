@@ -10,6 +10,7 @@ pub mod ibkr;
 pub mod journal;
 pub mod news;
 pub mod news_check;
+pub mod orders;
 pub mod pricing;
 pub mod risk;
 pub mod sample;

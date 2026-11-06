@@ -95,6 +95,21 @@ Trades on sample data go to `journal/sample_trades.csv`, and trades on real data
 to `journal/paper_trades.csv`, so invented trades never affect real risk limits or
 results. Use `--journal FILE` to choose another file.
 
+## Order tracking
+
+`src/orders.rs` tracks an order from intent to completion. It isn't connected to any
+broker yet: phase 1 runs only against a fake broker in `tests/orders.rs`.
+
+- **Crash safety:** every change is saved to `journal/orders.csv` before moving on,
+  and an order's intent is saved before it's sent.
+- **No duplicates:** a restart never resends. It asks the broker what happened.
+- **Limit orders only:** the order type has no way to express a market order.
+- **Stopping:** an order in an unknown or mismatched state blocks all new orders,
+  and so does the kill switch. A mismatch needs a person to check it.
+- **Daily caps:** 20 orders a day, and 20 contracts per order.
+
+`engine orders` lists recorded orders and never changes anything.
+
 ## Default limits
 
 On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in total,
@@ -154,6 +169,7 @@ Point `--data` at a folder containing these CSV files:
 
 ## Known limits
 
+- Order tracking has no real broker connection yet, and a fill reported after an order closes is only caught by the planned position sync.
 - Stops are only checked when `exits` runs, and a gap can take a loss well past 50%.
 - Exit thresholds are judgement calls, and there is no exit on a news reversal yet.
 - Expiry settles in cash at intrinsic value, with no assignment or stock delivery.

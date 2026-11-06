@@ -7,6 +7,7 @@ use engine::ibkr::{Ibkr, Mode};
 use engine::journal::{self, ClosedTrade, Entry, Ledger};
 use engine::news::KeywordScorer;
 use engine::news_check::{self, Label, LABELS};
+use engine::orders;
 use engine::risk::{Decision, Limits};
 use engine::sample;
 use engine::watchlist::{self, Theme, WATCHLIST};
@@ -26,6 +27,7 @@ USAGE:
   engine fetch [TICKERS...] [--delayed] [--port N] [--data DIR] [--journal FILE]
   engine news-grade [--source FILE] [--labels FILE]
   engine news-check [--labels FILE]
+  engine orders [--orders FILE]
   engine gen-sample [--data DIR] [--seed N] [--advance DAYS]
 
   --paper   record the approved trade or the exits in the paper journal
@@ -50,6 +52,7 @@ struct Args {
     seed: Option<u64>,
     advance: usize,
     delayed: bool,
+    orders: Option<PathBuf>,
     source: Option<PathBuf>,
     labels: Option<PathBuf>,
     port: Option<u16>,
@@ -63,6 +66,7 @@ fn parse(raw: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--paper" => a.paper = true,
             "--delayed" => a.delayed = true,
+            "--orders" => a.orders = Some(value()?.into()),
             "--source" => a.source = Some(value()?.into()),
             "--labels" => a.labels = Some(value()?.into()),
             "--port" => a.port = Some(value()?.parse().map_err(|_| "--port needs a port number")?),
@@ -525,6 +529,41 @@ fn cmd_fetch(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_orders(a: &Args) -> Result<(), String> {
+    let path = a
+        .orders
+        .clone()
+        .unwrap_or_else(|| "journal/orders.csv".into());
+    let list = orders::read_orders(&path)?;
+    if list.is_empty() {
+        println!("No orders recorded.");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<6} {:<24} {:>8} {:>8} {:>9} {:<13}",
+        "order", "ticker", "structure", "filled", "limit", "avg fill", "state"
+    );
+    for o in &list {
+        let average = o
+            .average_price()
+            .map_or("-".to_string(), |p| format!("{p:.2}"));
+        println!(
+            "{:<24} {:<6} {:<24} {:>8} {:>8.2} {:>9} {:<13}",
+            o.intent.id,
+            o.intent.ticker,
+            o.intent.structure,
+            format!("{}/{}", o.filled(), o.intent.quantity),
+            o.intent.limit,
+            average,
+            o.state.name()
+        );
+    }
+    for o in list.iter().filter(|o| o.state.blocks_trading()) {
+        println!("\nTRADING STOPPED by {}: {}", o.intent.id, o.detail);
+    }
+    Ok(())
+}
+
 fn labels_path(a: &Args) -> PathBuf {
     a.labels
         .clone()
@@ -624,6 +663,7 @@ fn run() -> Result<(), String> {
         Some("scan") => cmd_scan(&a),
         Some("news-grade") => cmd_news_grade(&a),
         Some("news-check") => cmd_news_check(&a),
+        Some("orders") => cmd_orders(&a),
         Some("fetch") => cmd_fetch(&a),
         Some("exits") => cmd_exits(&a),
         Some("positions") => cmd_positions(&a),
