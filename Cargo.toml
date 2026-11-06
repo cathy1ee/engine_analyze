@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+description = "Paper-only options analysis engine: news, volatility and factor signals to risk-checked option trades"
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[profile.release]
+lto = true

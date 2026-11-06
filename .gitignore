@@ -1,0 +1,5 @@
+/target
+/journal
+KILL_SWITCH
+.DS_Store
+.env
