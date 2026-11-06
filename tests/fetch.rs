@@ -4,7 +4,7 @@ use engine::data::{load, OptionQuote};
 use engine::dates::{days_from_civil, format_date};
 use engine::fetch::{run, Closes, Config, HeldLeg, Source, SourceError, Story};
 use engine::ibkr::{
-    check_paper_accounts, clean_headline, pick_expiries, pick_strikes, ports_to_try,
+    check_paper_accounts, clean_headline, gather_news, pick_expiries, pick_strikes, ports_to_try,
     quote_from_ticks, wanted_contracts, Mode,
 };
 use engine::journal::{exits_path, held_legs, EXIT_HEADER, HEADER};
@@ -502,6 +502,58 @@ fn closed_trades_are_not_held() {
             held("BBB", friday() + 14, 95.0, Right::Put)
         ]
     );
+}
+
+#[test]
+fn a_headline_with_line_breaks_cant_break_a_snapshot() {
+    let dir = temp();
+    let story = Story {
+        available_at: "2026-11-06T14:00:00Z".into(),
+        ticker: "TST".into(),
+        source: "BR\nFG".into(),
+        headline: "  Maker beats\r\nestimates\tagain ".into(),
+    };
+    let fake = Fake {
+        news: Ok(vec![story]),
+        ..Fake::healthy()
+    };
+    run(&fake, &config(&dir), now(0)).unwrap();
+    let m = load(&dir.join("latest")).unwrap();
+    assert_eq!(m.news[0].headline, "Maker beats estimates again");
+    assert_eq!(m.news[0].source, "BR FG");
+}
+
+fn story(ticker: &str) -> Story {
+    Story {
+        available_at: "2026-11-06T14:00:00Z".into(),
+        ticker: ticker.into(),
+        source: "BRFG".into(),
+        headline: "Maker beats estimates".into(),
+    }
+}
+
+#[test]
+fn one_failed_ticker_keeps_the_news_from_the_others() {
+    let tickers = vec!["AAA".to_string(), "BAD".to_string(), "CCC".to_string()];
+    let got = gather_news(&tickers, |t| {
+        if t == "BAD" {
+            Err("timed out".to_string())
+        } else {
+            Ok(vec![story(t)])
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        got.iter().map(|s| s.ticker.as_str()).collect::<Vec<_>>(),
+        ["AAA", "CCC"]
+    );
+}
+
+#[test]
+fn news_only_fails_when_every_ticker_fails() {
+    let tickers = vec!["AAA".to_string(), "BBB".to_string()];
+    let got = gather_news(&tickers, |_| Err("no access".to_string()));
+    assert_eq!(got, Err(SourceError::Skip("no access".to_string())));
 }
 
 #[test]

@@ -119,6 +119,11 @@ fn io(e: std::io::Error) -> String {
     e.to_string()
 }
 
+/// The CSV reader works line by line, so a saved field can't contain a line break.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn news_csv(stories: &[Story], fetched: &str) -> String {
     let mut csv = String::from("available_at,ticker,source,headline,fetched_at\n");
     for n in stories {
@@ -127,8 +132,8 @@ fn news_csv(stories: &[Story], fetched: &str) -> String {
             "{},{},{},{},{fetched}",
             n.available_at,
             n.ticker,
-            quote(&n.source),
-            quote(&n.headline)
+            quote(&one_line(&n.source)),
+            quote(&one_line(&n.headline))
         );
     }
     csv
