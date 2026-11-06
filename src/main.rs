@@ -6,9 +6,11 @@ use engine::fetch;
 use engine::ibkr::{Ibkr, Mode};
 use engine::journal::{self, ClosedTrade, Entry, Ledger};
 use engine::news::KeywordScorer;
+use engine::news_check::{self, Label, LABELS};
 use engine::risk::{Decision, Limits};
 use engine::sample;
 use engine::watchlist::{self, Theme, WATCHLIST};
+use std::io::{stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +24,8 @@ USAGE:
   engine exits [--paper] [--data DIR] [--journal FILE]
   engine positions [--data DIR] [--journal FILE]
   engine fetch [TICKERS...] [--delayed] [--port N] [--data DIR] [--journal FILE]
+  engine news-grade [--source FILE] [--labels FILE]
+  engine news-check [--labels FILE]
   engine gen-sample [--data DIR] [--seed N] [--advance DAYS]
 
   --paper   record the approved trade or the exits in the paper journal
@@ -29,6 +33,8 @@ USAGE:
   --delayed use IBKR's free delayed data instead of a paid subscription
   --port    TWS or IB Gateway paper port; 7497 and 4002 are tried by default
   --data    data folder, e.g. data/live/latest after running fetch
+  --source  CSV with a headline column; defaults to the practice headlines
+  --labels  where your grades are kept
   --theme   tag news and journal rows with a theme, e.g. blue-wave
 
 Create a file named KILL_SWITCH in this folder to block all new trades.
@@ -44,6 +50,8 @@ struct Args {
     seed: Option<u64>,
     advance: usize,
     delayed: bool,
+    source: Option<PathBuf>,
+    labels: Option<PathBuf>,
     port: Option<u16>,
 }
 
@@ -55,6 +63,8 @@ fn parse(raw: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--paper" => a.paper = true,
             "--delayed" => a.delayed = true,
+            "--source" => a.source = Some(value()?.into()),
+            "--labels" => a.labels = Some(value()?.into()),
             "--port" => a.port = Some(value()?.parse().map_err(|_| "--port needs a port number")?),
             "--theme" => a.theme = Some(value()?),
             "--data" => a.data = Some(value()?.into()),
@@ -515,12 +525,105 @@ fn cmd_fetch(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn labels_path(a: &Args) -> PathBuf {
+    a.labels
+        .clone()
+        .unwrap_or_else(|| "journal/news_labels.csv".into())
+}
+
+fn cmd_news_grade(a: &Args) -> Result<(), String> {
+    let source = a
+        .source
+        .clone()
+        .unwrap_or_else(|| "data/news_practice.csv".into());
+    let headlines = news_check::load_headlines(&source)?;
+    let path = labels_path(a);
+    let graded = news_check::grade(&headlines, &path, &mut stdin().lock(), &mut stdout())?;
+    println!("\nSaved {graded} grades. Run `engine news-check` to see how the scorer did.");
+    Ok(())
+}
+
+fn percent(v: Option<f64>) -> String {
+    v.map_or("n/a".to_string(), |x| format!("{:.0}%", x * 100.0))
+}
+
+fn cmd_news_check(a: &Args) -> Result<(), String> {
+    let labels = news_check::load_labels(&labels_path(a))?;
+    if labels.is_empty() {
+        println!("No grades yet. Run `engine news-grade` first.");
+        return Ok(());
+    }
+    let r = news_check::evaluate(&labels, &KeywordScorer);
+    let (lo, hi) = r.interval();
+    println!("Keyword scorer against your {} grades\n", r.total);
+    println!(
+        "  agreement        {:.0}%  (95% range {:.0}% to {:.0}%)",
+        r.accuracy() * 100.0,
+        lo * 100.0,
+        hi * 100.0
+    );
+    println!(
+        "  always guessing  {:.0}%  (your most common grade every time)",
+        r.baseline() * 100.0
+    );
+    println!(
+        "  kappa            {:.2}  (0 = chance, 1 = perfect)",
+        r.kappa()
+    );
+    println!(
+        "  opposite calls   {}  (good called bad, or bad called good)",
+        r.opposite_calls()
+    );
+
+    println!(
+        "\n{:<12} {:>8} {:>8} {:>8}",
+        "you \\ scorer", "bad", "neutral", "good"
+    );
+    for l in LABELS {
+        let row = r.matrix[l as usize];
+        println!("{:<12} {:>8} {:>8} {:>8}", l.name(), row[0], row[1], row[2]);
+    }
+
+    println!("\n{:<10} {:>10} {:>8}", "", "precision", "recall");
+    for l in [Label::Good, Label::Bad] {
+        println!(
+            "{:<10} {:>10} {:>8}",
+            l.name(),
+            percent(r.precision(l)),
+            percent(r.recall(l))
+        );
+    }
+
+    if !r.misses.is_empty() {
+        println!("\nWorst disagreements");
+        for m in r.misses.iter().take(10) {
+            println!(
+                "  you {:<7} scorer {:<7} {:+.2}  {}",
+                m.yours.name(),
+                m.scorer.name(),
+                m.score,
+                m.headline
+            );
+        }
+    }
+    if r.total < news_check::ENOUGH_LABELS {
+        println!(
+            "\nOnly {} grades so far, so treat this as a rough guide. Aim for {}.",
+            r.total,
+            news_check::ENOUGH_LABELS
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let a = parse(&raw)?;
     match a.positional.first().map(String::as_str) {
         Some("analyze") => cmd_analyze(&a),
         Some("scan") => cmd_scan(&a),
+        Some("news-grade") => cmd_news_grade(&a),
+        Some("news-check") => cmd_news_check(&a),
         Some("fetch") => cmd_fetch(&a),
         Some("exits") => cmd_exits(&a),
         Some("positions") => cmd_positions(&a),

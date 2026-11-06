@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod ibkr;
 pub mod journal;
 pub mod news;
+pub mod news_check;
 pub mod pricing;
 pub mod risk;
 pub mod sample;

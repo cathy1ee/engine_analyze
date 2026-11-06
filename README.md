@@ -61,6 +61,27 @@ cargo run --release -- exits --paper --data /tmp/day10
 | Exits | `src/exits.rs` | Decides when an open trade should close |
 | Journal | `src/journal.rs` | Records trades and exits, and marks positions at exit prices |
 
+## Checking the news scorer
+
+Grade headlines yourself, then measure how often the scorer agrees. The scorer's
+answers stay hidden while you grade, and stopping part way loses nothing.
+
+```bash
+cargo run --release -- news-grade
+cargo run --release -- news-check
+```
+
+`data/news_practice.csv` has 60 invented headlines about fictional companies, many
+written to be tricky. Once real snapshots exist, grade those too:
+
+```bash
+cargo run --release -- news-grade --source data/live/latest/news.csv
+```
+
+Compare agreement with the "always guessing" line, which is the score to beat. Your
+grades stay in `journal/news_labels.csv`, outside Git. This shows whether the scorer
+reads headlines the way you do, not whether those headlines predict returns.
+
 ## Default limits
 
 On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in total,
@@ -127,6 +148,7 @@ Point `--data` at a folder containing these CSV files:
 - Expected value assumes a lognormal price at expiry, which understates jumps.
 - Forecast weights in `src/selection.rs` are judgement calls, not fitted values.
 - Picking the best of many structures flatters the top result's estimated edge.
+- News grades reflect one person's judgement, and practice headlines are not a random sample of real news.
 - News scoring is a keyword baseline, and `NewsScorer` is where a better model plugs in.
 - Themes only tag news and journal rows. They do not change forecasts.
 - There is no backtester yet, because it needs historical options data.
