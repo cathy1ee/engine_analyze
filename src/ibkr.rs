@@ -1,6 +1,7 @@
 //! Reads market data from a running TWS or IB Gateway paper session.
 //!
-//! This file only ever requests data. It refuses IBKR's live ports, and it never
+//! This file only ever requests data. It refuses IBKR's live ports and live
+//! accounts, and it never
 //! uses the order functions in the `ibapi` crate; a test in `tests/fetch.rs`
 //! checks that. For a second lock, turn on Read-Only API in TWS.
 use crate::data::OptionQuote;
@@ -67,6 +68,22 @@ pub fn ports_to_try(requested: Option<u16>) -> Result<Vec<u16>, String> {
         Some(p) => Ok(vec![p]),
         None => Ok(PAPER_PORTS.to_vec()),
     }
+}
+
+/// Ports can be changed in TWS, so this checks the session itself. IBKR paper
+/// account IDs start with D.
+pub fn check_paper_accounts(accounts: &[String]) -> Result<(), String> {
+    if accounts.is_empty() {
+        return Err(
+            "IBKR reported no accounts, so this can't be confirmed as a paper session.".into(),
+        );
+    }
+    if accounts.iter().any(|a| !a.starts_with('D')) {
+        return Err(
+            "this looks like a live IBKR session. Log in to Paper Trading and try again.".into(),
+        );
+    }
+    Ok(())
 }
 
 /// What to request: the usual grid plus any held contracts not already on it.
@@ -250,6 +267,10 @@ impl Ibkr {
                      paper account, and turn on API socket connections."
                 )
             })?;
+        let accounts = client
+            .managed_accounts()
+            .map_err(|e| format!("could not read the IBKR account list: {e}"))?;
+        check_paper_accounts(&accounts)?;
         client
             .switch_market_data_type(mode.data_type())
             .map_err(|e| format!("IBKR refused the market data setting: {e}"))?;
