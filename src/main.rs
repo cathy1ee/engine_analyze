@@ -1,9 +1,10 @@
 use engine::analyze::{analyze, Analysis, Context};
-use engine::broker::{Broker, Order, PaperBroker};
+use engine::broker::{Broker, CloseOrder, Order, PaperBroker};
 use engine::data::{self, Market};
-use engine::journal::{self, Entry};
+use engine::exits::{self, ExitRules};
+use engine::journal::{self, ClosedTrade, Entry, Ledger};
 use engine::news::KeywordScorer;
-use engine::risk::{Book, Decision, Limits};
+use engine::risk::{Decision, Limits};
 use engine::sample;
 use engine::watchlist::{self, Theme, WATCHLIST};
 use std::path::{Path, PathBuf};
@@ -16,13 +17,16 @@ Paper-only options engine
 USAGE:
   engine analyze <TICKER> [--paper] [--theme NAME] [--data DIR] [--journal FILE]
   engine scan [--theme NAME] [--data DIR] [--journal FILE]
+  engine exits [--paper] [--data DIR] [--journal FILE]
   engine positions [--data DIR] [--journal FILE]
-  engine gen-sample [--data DIR] [--seed N]
+  engine gen-sample [--data DIR] [--seed N] [--advance DAYS]
 
-  --paper   record the approved trade in the paper journal
+  --paper   record the approved trade or the exits in the paper journal
+  --advance write a snapshot this many trading days later, to simulate time
   --theme   tag news and journal rows with a theme, e.g. blue-wave
 
-Create a file named KILL_SWITCH in this folder to block all new trades.";
+Create a file named KILL_SWITCH in this folder to block all new trades.
+Exits still work with it on, because closing a position reduces risk.";
 
 #[derive(Default)]
 struct Args {
@@ -32,6 +36,7 @@ struct Args {
     data: Option<PathBuf>,
     journal: Option<PathBuf>,
     seed: Option<u64>,
+    advance: usize,
 }
 
 fn parse(raw: &[String]) -> Result<Args, String> {
@@ -44,6 +49,11 @@ fn parse(raw: &[String]) -> Result<Args, String> {
             "--theme" => a.theme = Some(value()?),
             "--data" => a.data = Some(value()?.into()),
             "--journal" => a.journal = Some(value()?.into()),
+            "--advance" => {
+                a.advance = value()?
+                    .parse()
+                    .map_err(|_| "--advance needs a whole number")?
+            }
             "--seed" => {
                 a.seed = Some(
                     value()?
@@ -159,7 +169,7 @@ fn print_analysis(a: &Analysis, m: &Market, elapsed_ms: f64) {
 
 struct Session {
     market: Market,
-    book: Book,
+    ledger: Ledger,
     limits: Limits,
     theme: Option<Theme>,
     kill: bool,
@@ -179,15 +189,17 @@ fn open(a: &Args) -> Result<Session, String> {
         .journal
         .clone()
         .unwrap_or_else(|| "journal/paper_trades.csv".into());
-    let (book, _) = journal::load(&journal, &market)?;
+    let ledger = journal::load(&journal, &market)?;
+    let mut limits = Limits::default();
+    limits.equity += ledger.book.realized_total;
     let theme = match &a.theme {
         Some(n) => Some(watchlist::theme(n).ok_or(format!("unknown theme '{n}'"))?),
         None => None,
     };
     Ok(Session {
         market,
-        book,
-        limits: Limits::default(),
+        ledger,
+        limits,
         theme,
         kill: Path::new("KILL_SWITCH").exists(),
         journal,
@@ -201,7 +213,7 @@ impl Session {
             scorer: &KeywordScorer,
             theme: self.theme.as_ref(),
             limits: &self.limits,
-            book: &self.book,
+            book: &self.ledger.book,
             kill_switch: self.kill,
         }
     }
@@ -302,30 +314,128 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_positions(a: &Args) -> Result<(), String> {
+fn cmd_exits(a: &Args) -> Result<(), String> {
     let s = open(a)?;
     sample_banner(&s.market);
-    let (book, marked) = journal::load(&s.journal, &s.market)?;
-    if marked.is_empty() {
+    if s.ledger.open.is_empty() {
         println!("No open paper positions.");
         return Ok(());
     }
+    let rules = ExitRules::default();
     println!(
-        "{:<6} {:<25} {:>9} {:>9} {:>10}",
-        "ticker", "structure", "contracts", "risk", "open PnL"
+        "{:<4} {:<6} {:<25} {:>9} {:>10} {:>7}  action",
+        "id", "ticker", "structure", "days left", "open PnL", "of risk"
     );
-    for p in &marked {
-        let pnl = p.pnl.map_or("no quote".to_string(), |v| format!("{v:+.0}"));
+    let mut closed = 0;
+    let mut realized = 0.0;
+    for t in &s.ledger.open {
+        let reason = exits::evaluate(&rules, t.risk, t.pnl, t.days_left);
+        let (pnl, share) = t
+            .pnl
+            .map_or(("no price".to_string(), "-".to_string()), |v| {
+                (format!("{v:+.0}"), format!("{:+.0}%", v / t.risk * 100.0))
+            });
+        let action = match reason {
+            Some(r) => format!("close: {}", r.label()),
+            None if t.pnl.is_none() => "hold: cannot price it".to_string(),
+            None => "hold".to_string(),
+        };
         println!(
-            "{:<6} {:<25} {:>9} {:>9.0} {:>10}",
-            p.ticker, p.structure, p.contracts, p.risk, pnl
+            "{:<4} {:<6} {:<25} {:>9} {:>10} {:>7}  {action}",
+            t.id, t.ticker, t.structure, t.days_left, pnl, share
+        );
+        if let (true, Some(r), Some(value)) = (a.paper, reason, t.exit_value) {
+            let fill = PaperBroker.close(&CloseOrder {
+                value,
+                hedge_price: t.hedge_exit,
+            })?;
+            realized += journal::record_exit(&s.journal, t, &fill, r, &s.market.as_of_date)?;
+            closed += 1;
+        }
+    }
+    if a.paper {
+        println!("\nClosed {closed} paper trades, realized ${realized:+.0}");
+    } else {
+        println!("\nPreview only. Add --paper to record these exits.");
+    }
+    Ok(())
+}
+
+fn print_summary(label: &str, trades: &[&ClosedTrade]) {
+    let s = journal::summarize(trades.iter().copied());
+    println!(
+        "{:<14} {:>6} {:>5.0}% {:>10.0} {:>11.0}",
+        label,
+        s.trades,
+        s.wins as f64 / s.trades.max(1) as f64 * 100.0,
+        s.pnl,
+        s.forecast_ev
+    );
+}
+
+fn cmd_positions(a: &Args) -> Result<(), String> {
+    let s = open(a)?;
+    sample_banner(&s.market);
+    let l = &s.ledger;
+    if l.open.is_empty() {
+        println!("No open paper positions.");
+    } else {
+        println!(
+            "{:<4} {:<6} {:<25} {:>9} {:>9} {:>9} {:>10}",
+            "id", "ticker", "structure", "contracts", "days left", "risk", "open PnL"
+        );
+        for p in &l.open {
+            let pnl = p.pnl.map_or("no price".to_string(), |v| format!("{v:+.0}"));
+            println!(
+                "{:<4} {:<6} {:<25} {:>9} {:>9} {:>9.0} {:>10}",
+                p.id, p.ticker, p.structure, p.contracts, p.days_left, p.risk, pnl
+            );
+        }
+        println!(
+            "\nTotal at risk ${:.0}   open PnL ${:+.0} (marked at exit prices)",
+            l.book.total_risk(),
+            l.book.unrealized_pnl
         );
     }
+    if l.closed.is_empty() {
+        return Ok(());
+    }
+
+    println!("\nClosed trades");
     println!(
-        "\nTotal at risk ${:.0}   open PnL ${:+.0} (marked at exit prices)",
-        book.total_risk(),
-        book.unrealized_pnl
+        "{:<4} {:<6} {:<25} {:<12} {:<11} {:>4} {:>9}",
+        "id", "ticker", "structure", "exit date", "reason", "days", "PnL"
     );
+    for c in &l.closed {
+        println!(
+            "{:<4} {:<6} {:<25} {:<12} {:<11} {:>4} {:>+9.0}",
+            c.id, c.ticker, c.structure, c.exit_date, c.reason, c.days_held, c.pnl
+        );
+    }
+
+    println!("\nResults against forecast");
+    println!(
+        "{:<14} {:>6} {:>6} {:>10} {:>11}",
+        "", "trades", "wins", "PnL", "forecast EV"
+    );
+    print_summary("all", &l.closed.iter().collect::<Vec<_>>());
+    let mut themes: Vec<&str> = l
+        .closed
+        .iter()
+        .map(|c| c.theme.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
+    themes.sort_unstable();
+    themes.dedup();
+    for theme in themes {
+        print_summary(
+            theme,
+            &l.closed
+                .iter()
+                .filter(|c| c.theme == theme)
+                .collect::<Vec<_>>(),
+        );
+    }
     Ok(())
 }
 
@@ -335,10 +445,11 @@ fn run() -> Result<(), String> {
     match a.positional.first().map(String::as_str) {
         Some("analyze") => cmd_analyze(&a),
         Some("scan") => cmd_scan(&a),
+        Some("exits") => cmd_exits(&a),
         Some("positions") => cmd_positions(&a),
         Some("gen-sample") => {
             let dir = a.data.clone().unwrap_or_else(|| "data/sample".into());
-            sample::generate(&dir, a.seed.unwrap_or(42))?;
+            sample::generate(&dir, a.seed.unwrap_or(42), a.advance)?;
             println!(
                 "Wrote synthetic data for {} stocks to {}",
                 WATCHLIST.len(),

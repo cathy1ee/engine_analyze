@@ -36,6 +36,10 @@ pub struct OpenPosition {
 pub struct Book {
     pub positions: Vec<OpenPosition>,
     pub unrealized_pnl: f64,
+    pub realized_today: f64,
+    pub realized_total: f64,
+    /// Tickers exited today, which can't be re-entered until the next session.
+    pub closed_today: Vec<String>,
 }
 
 impl Book {
@@ -84,14 +88,19 @@ pub fn decide(l: &Limits, kill_switch: bool, book: &Book, r: &Request) -> Decisi
     if kill_switch {
         return Decision::Blocked("kill switch is on".into());
     }
-    if book.unrealized_pnl <= -l.max_loss * l.equity {
+    // Realized losses count too, or closing a loser would reset the limit.
+    let pnl_today = book.unrealized_pnl + book.realized_today;
+    if pnl_today <= -l.max_loss * l.equity {
         return Decision::Blocked(format!(
-            "loss limit hit: open PnL is ${:.0}",
-            book.unrealized_pnl
+            "loss limit hit: open and today's closed PnL is ${pnl_today:.0}"
         ));
     }
     if book.positions.iter().any(|p| p.ticker == r.ticker) {
         return Decision::Blocked(format!("already holding a position in {}", r.ticker));
+    }
+
+    if book.closed_today.iter().any(|t| t == r.ticker) {
+        return Decision::Blocked(format!("{} was already closed today", r.ticker));
     }
 
     let per_contract = r.candidate.max_loss * 100.0;
@@ -200,8 +209,40 @@ mod tests {
         let book = Book {
             positions: vec![],
             unrealized_pnl: -2_000.0,
+            ..Book::default()
         };
         assert!(blocked(decide(&Limits::default(), false, &book, &req(&c))).contains("loss limit"));
+    }
+
+    #[test]
+    fn closed_losses_still_count_towards_the_loss_limit() {
+        let c = cand(1.0, 0.0);
+        let book = Book {
+            realized_today: -1_500.0,
+            unrealized_pnl: -500.0,
+            ..Book::default()
+        };
+        assert!(blocked(decide(&Limits::default(), false, &book, &req(&c))).contains("loss limit"));
+        let yesterday = Book {
+            realized_total: -5_000.0,
+            ..Book::default()
+        };
+        assert!(matches!(
+            decide(&Limits::default(), false, &yesterday, &req(&c)),
+            Decision::Approved { .. }
+        ));
+    }
+
+    #[test]
+    fn no_same_day_reentry_after_an_exit() {
+        let c = cand(1.0, 0.0);
+        let book = Book {
+            closed_today: vec!["INTC".into()],
+            ..Book::default()
+        };
+        assert!(
+            blocked(decide(&Limits::default(), false, &book, &req(&c))).contains("closed today")
+        );
     }
 
     #[test]
@@ -210,6 +251,7 @@ mod tests {
         let book = Book {
             positions: vec![pos("INTC", "chips", 100.0)],
             unrealized_pnl: 0.0,
+            ..Book::default()
         };
         assert!(blocked(decide(&Limits::default(), false, &book, &req(&c))).contains("already"));
     }
@@ -220,6 +262,7 @@ mod tests {
         let book = Book {
             positions: vec![pos("AMD", "chips", 3_800.0)],
             unrealized_pnl: 0.0,
+            ..Book::default()
         };
         match decide(&Limits::default(), false, &book, &req(&c)) {
             Decision::Approved { contracts, .. } => assert_eq!(contracts, 2),
@@ -228,6 +271,7 @@ mod tests {
         let full = Book {
             positions: vec![pos("XOM", "oil", 10_000.0)],
             unrealized_pnl: 0.0,
+            ..Book::default()
         };
         assert!(blocked(decide(&Limits::default(), false, &full, &req(&c))).contains("budget"));
     }

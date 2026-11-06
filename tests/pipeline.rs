@@ -17,7 +17,7 @@ fn temp(name: &str) -> PathBuf {
 
 fn market(name: &str) -> Market {
     let d = temp(name);
-    generate(&d, 42).unwrap();
+    generate(&d, 42, 0).unwrap();
     load(&d).unwrap()
 }
 
@@ -35,8 +35,8 @@ fn ctx<'a>(m: &'a Market, l: &'a Limits, b: &'a Book, kill: bool) -> Context<'a>
 #[test]
 fn sample_data_is_marked_and_reproducible() {
     let (a, b) = (temp("repro-a"), temp("repro-b"));
-    generate(&a, 7).unwrap();
-    generate(&b, 7).unwrap();
+    generate(&a, 7, 0).unwrap();
+    generate(&b, 7, 0).unwrap();
     assert_eq!(
         std::fs::read(a.join("options.csv")).unwrap(),
         std::fs::read(b.join("options.csv")).unwrap()
@@ -129,7 +129,8 @@ fn journal_feeds_back_into_risk_limits() {
     };
     journal::append(&path, &entry).unwrap();
 
-    let (book, marked) = journal::load(&path, &m).unwrap();
+    let ledger = journal::load(&path, &m).unwrap();
+    let (book, marked) = (ledger.book, ledger.open);
     assert_eq!(book.positions.len(), 1);
     assert!((book.total_risk() - risk).abs() < 0.01);
     // Exiting straight away must cost money: the spread is paid on the way out too.

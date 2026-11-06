@@ -15,11 +15,38 @@ markets. Nothing here is investment advice.
 cargo run --release -- analyze INTC --theme blue-wave
 cargo run --release -- scan
 cargo run --release -- analyze NVDA --paper
+cargo run --release -- exits
+cargo run --release -- exits --paper
 cargo run --release -- positions
 cargo test
 ```
 
 Create a file named `KILL_SWITCH` in the project folder to block all new trades.
+Exits still work with it on, because closing a position reduces risk.
+
+## Exits
+
+`engine exits` previews what would close, and `engine exits --paper` records it.
+Run it after each new data update, because exits are only checked when it runs.
+
+| Rule | Closes when |
+|---|---|
+| Expired | The expiry date has passed; settles at that day's close |
+| Stop loss | The loss reaches 50% of the risk taken |
+| Take profit | The profit reaches 50% of the risk taken |
+| Time exit | 7 or fewer days remain |
+
+Exits use the prices you could actually get: sell at the bid, buy at the ask, pay
+commission, and include any hedge. A position with no price is held, not guessed.
+A ticker can't be re-entered on the day it closes. `engine positions` compares
+realized PnL with the forecast EV, overall and for each theme.
+
+To simulate time on sample data, write later snapshots of the same history:
+
+```bash
+cargo run --release -- gen-sample --data /tmp/day10 --advance 10
+cargo run --release -- exits --paper --data /tmp/day10
+```
 
 ## Pipeline
 
@@ -31,12 +58,14 @@ Create a file named `KILL_SWITCH` in the project folder to block all new trades.
 | Selection | `src/selection.rs` | Forecasts, builds structures, ranks by EV after costs |
 | Risk | `src/risk.rs` | Enforces limits, sizes trades, proposes hedges |
 | Broker | `src/broker.rs` | Simulates fills at the bid and ask |
-| Journal | `src/journal.rs` | Records each trade and marks it at exit prices |
+| Exits | `src/exits.rs` | Decides when an open trade should close |
+| Journal | `src/journal.rs` | Records trades and exits, and marks positions at exit prices |
 
 ## Default limits
 
 On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in total,
-and new trades stop once open losses reach 2%. Only defined-risk structures are built.
+and new trades stop once open losses plus today's closed losses reach 2%.
+The account value used for these limits moves with realized PnL. Only defined-risk structures are built.
 
 ## Using real data
 
@@ -53,7 +82,9 @@ Point `--data` at a folder containing these CSV files:
 
 ## Known limits
 
-- Positions never close: there is no exit logic, and expiry is not tracked yet.
+- Stops are only checked when `exits` runs, and a gap can take a loss well past 50%.
+- Exit thresholds are judgement calls, and there is no exit on a news reversal yet.
+- Expiry settles in cash at intrinsic value, with no assignment or stock delivery.
 - Pricing is European Black-Scholes, so early exercise and dividends are ignored.
 - Expected value assumes a lognormal price at expiry, which understates jumps.
 - Forecast weights in `src/selection.rs` are judgement calls, not fitted values.

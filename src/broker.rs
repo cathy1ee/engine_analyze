@@ -17,11 +17,29 @@ pub struct Fill {
     pub hedge_price: Option<f64>,
 }
 
+pub struct CloseOrder {
+    /// Per share including commission, at the prices the position can exit at.
+    pub value: f64,
+    pub hedge_price: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloseFill {
+    pub value: f64,
+    pub hedge_price: Option<f64>,
+}
+
 pub trait Broker {
     fn submit(&mut self, order: &Order) -> Result<Fill, String>;
+    fn close(&mut self, order: &CloseOrder) -> Result<CloseFill, String>;
 }
 
 const HEDGE_SLIPPAGE: f64 = 0.0002;
+
+/// Unwinding a hedge also fills slightly against us: sell lower, buy back higher.
+pub fn hedge_exit_price(price: f64, shares: f64) -> f64 {
+    price * (1.0 - HEDGE_SLIPPAGE * shares.signum())
+}
 
 #[derive(Default)]
 pub struct PaperBroker;
@@ -37,6 +55,13 @@ impl Broker for PaperBroker {
             hedge_price: o
                 .hedge
                 .map(|h| h.price * (1.0 + HEDGE_SLIPPAGE * (h.shares as f64).signum())),
+        })
+    }
+
+    fn close(&mut self, o: &CloseOrder) -> Result<CloseFill, String> {
+        Ok(CloseFill {
+            value: o.value,
+            hedge_price: o.hedge_price,
         })
     }
 }
