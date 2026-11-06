@@ -554,7 +554,9 @@ fn news_only_fails_when_every_ticker_fails() {
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
     let got = gather_news(&tickers, |_| Err("no access".to_string()));
     assert_eq!(got, Err(SourceError::Skip("no access".to_string())));
+}
 
+#[test]
 fn only_paper_accounts_are_accepted() {
     assert!(check_paper_accounts(&["DU1234567".to_string()]).is_ok());
     let live = check_paper_accounts(&["U1234567".to_string()]).unwrap_err();
