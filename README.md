@@ -82,6 +82,12 @@ Compare agreement with the "always guessing" line, which is the score to beat. Y
 grades stay in `journal/news_labels.csv`, outside Git. This shows whether the scorer
 reads headlines the way you do, not whether those headlines predict returns.
 
+## Journals
+
+Trades on sample data go to `journal/sample_trades.csv`, and trades on real data go
+to `journal/paper_trades.csv`, so invented trades never affect real risk limits or
+results. Use `--journal FILE` to choose another file.
+
 ## Default limits
 
 On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in total,
