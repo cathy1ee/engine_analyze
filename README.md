@@ -78,6 +78,13 @@ written to be tricky. Once real snapshots exist, grade those too:
 cargo run --release -- news-grade --source data/live/latest/news.csv
 ```
 
+`data/news_holdout.csv` is a separate graded test set. Don't tune the scorer against
+it, or it stops being a fair test:
+
+```bash
+cargo run --release -- news-check --labels data/news_holdout.csv
+```
+
 Compare agreement with the "always guessing" line, which is the score to beat. Your
 grades stay in `journal/news_labels.csv`, outside Git. This shows whether the scorer
 reads headlines the way you do, not whether those headlines predict returns.
