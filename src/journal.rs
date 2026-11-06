@@ -81,6 +81,17 @@ pub fn append(path: &Path, e: &Entry) -> Result<(), String> {
     append_row(path, HEADER, &cells)
 }
 
+/// Sample trades get their own journal, so invented data can't touch the risk
+/// limits or results of real paper trading.
+pub fn default_path(is_sample: bool) -> PathBuf {
+    let name = if is_sample {
+        "sample_trades.csv"
+    } else {
+        "paper_trades.csv"
+    };
+    Path::new("journal").join(name)
+}
+
 /// The exits file for a trades file: `trades.csv` -> `trades_exits.csv`.
 pub fn exits_path(path: &Path) -> PathBuf {
     let stem = path

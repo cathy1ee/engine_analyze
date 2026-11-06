@@ -220,7 +220,7 @@ fn open(a: &Args) -> Result<Session, String> {
     let journal = a
         .journal
         .clone()
-        .unwrap_or_else(|| "journal/paper_trades.csv".into());
+        .unwrap_or_else(|| journal::default_path(market.is_sample));
     let ledger = journal::load(&journal, &market)?;
     let mut limits = Limits::default();
     limits.equity += ledger.book.realized_total;
@@ -502,7 +502,7 @@ fn cmd_fetch(a: &Args) -> Result<(), String> {
     let journal = a
         .journal
         .clone()
-        .unwrap_or_else(|| "journal/paper_trades.csv".into());
+        .unwrap_or_else(|| journal::default_path(false));
     let cfg = fetch::Config {
         dir: dir.clone(),
         held: journal::held_legs(&journal)?,

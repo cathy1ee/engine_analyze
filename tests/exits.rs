@@ -290,3 +290,12 @@ fn sample_snapshots_share_one_history_and_keep_contracts_listed() {
         .all(|q| later.contains(&(q.expiry_days - elapsed))));
     assert!(generate(&a, 42, 41).is_err());
 }
+
+#[test]
+fn sample_and_real_trades_default_to_separate_journals() {
+    assert_ne!(journal::default_path(true), journal::default_path(false));
+    assert_eq!(
+        journal::default_path(false),
+        Path::new("journal/paper_trades.csv")
+    );
+}

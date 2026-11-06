@@ -4,8 +4,8 @@ use engine::data::{load, OptionQuote};
 use engine::dates::{days_from_civil, format_date};
 use engine::fetch::{run, Closes, Config, HeldLeg, Source, SourceError, Story};
 use engine::ibkr::{
-    clean_headline, gather_news, pick_expiries, pick_strikes, ports_to_try, quote_from_ticks,
-    wanted_contracts, Mode,
+    check_paper_accounts, clean_headline, gather_news, pick_expiries, pick_strikes, ports_to_try,
+    quote_from_ticks, wanted_contracts, Mode,
 };
 use engine::journal::{exits_path, held_legs, EXIT_HEADER, HEADER};
 use engine::news::KeywordScorer;
@@ -554,4 +554,17 @@ fn news_only_fails_when_every_ticker_fails() {
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
     let got = gather_news(&tickers, |_| Err("no access".to_string()));
     assert_eq!(got, Err(SourceError::Skip("no access".to_string())));
+
+fn only_paper_accounts_are_accepted() {
+    assert!(check_paper_accounts(&["DU1234567".to_string()]).is_ok());
+    let live = check_paper_accounts(&["U1234567".to_string()]).unwrap_err();
+    assert!(live.contains("live"), "{live}");
+    assert!(check_paper_accounts(&["DU1".to_string(), "U2".to_string()]).is_err());
+    assert!(check_paper_accounts(&[]).is_err());
+}
+
+#[test]
+fn account_messages_never_repeat_the_account_id() {
+    let e = check_paper_accounts(&["U1234567".to_string()]).unwrap_err();
+    assert!(!e.contains("1234567"));
 }
