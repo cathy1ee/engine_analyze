@@ -18,11 +18,14 @@ pub struct KeywordScorer;
 const LEXICON: &[(&str, f64)] = &[
     ("beats", 0.6),
     ("beat", 0.6),
+    ("beats back", 0.0),
+    ("beat back", 0.0),
     ("raises guidance", 0.8),
     ("raises", 0.4),
     ("upgrade", 0.5),
     ("upgraded", 0.5),
     ("wins", 0.4),
+    ("win", 0.4),
     ("record", 0.3),
     ("surges", 0.5),
     ("soars", 0.5),
@@ -31,26 +34,100 @@ const LEXICON: &[(&str, f64)] = &[
     ("contract", 0.3),
     ("buyback", 0.3),
     ("strong", 0.3),
+    ("favorable", 0.4),
+    ("secures", 0.4),
+    ("clears", 0.4),
+    ("discovers", 0.3),
+    ("signs", 0.3),
+    ("cuts costs", 0.4),
+    ("cuts debt", 0.4),
     ("misses", -0.6),
     ("miss", -0.6),
+    ("missed", -0.6),
     ("cuts guidance", -0.8),
+    ("cut guidance", -0.8),
     ("cuts", -0.4),
     ("downgrade", -0.5),
     ("downgraded", -0.5),
     ("lawsuit", -0.4),
+    ("suit", -0.4),
     ("probe", -0.5),
     ("investigation", -0.5),
+    ("charges", -0.3),
+    ("strike", -0.3),
+    ("liability", -0.3),
     ("recall", -0.5),
     ("plunges", -0.5),
     ("falls", -0.3),
+    ("fall", -0.3),
+    ("fails to lift", -0.3),
+    ("loses", -0.5),
     ("warns", -0.5),
     ("delay", -0.4),
     ("delays", -0.4),
     ("weak", -0.3),
     ("layoffs", -0.2),
+    ("restrictions", -0.4),
+    ("resignation", -0.4),
+    ("steps down", -0.4),
+    ("short seller", -0.4),
+    ("fire", -0.4),
 ];
 
 const NEGATIONS: &[&str] = &["not", "no", "never", "without", "fails", "failed"];
+const NEGATION_REACH: usize = 3;
+
+/// Legal and labour troubles turn good when something resolves them.
+const RISKS: &[&str] = &[
+    "lawsuit",
+    "suit",
+    "probe",
+    "investigation",
+    "charges",
+    "strike",
+];
+const RESOLVERS: &[&str] = &[
+    "dismisses",
+    "dismissed",
+    "drops",
+    "dropped",
+    "closes",
+    "closed",
+    "ends",
+    "ended",
+    "wins",
+    "won",
+];
+const RESOLVER_REACH: usize = 4;
+
+/// In "X despite Y", Y is background. In "X but Y", Y is what matters most.
+const CONCESSIONS: &[&str] = &["despite", "although", "though"];
+const CONCESSION_WEIGHT: f64 = 0.25;
+const CONTRASTS: &[&str] = &["but", "however", "yet"];
+const BEFORE_CONTRAST_WEIGHT: f64 = 0.5;
+
+/// How much each word counts, given where it sits around a contrast word.
+fn clause_weights(toks: &[String]) -> Vec<f64> {
+    let mut weights = vec![1.0; toks.len()];
+    let find = |list: &[&str]| toks.iter().position(|t| list.contains(&t.as_str()));
+    if let Some(i) = find(CONCESSIONS) {
+        weights[i..].fill(CONCESSION_WEIGHT);
+    }
+    if let Some(i) = find(CONTRASTS) {
+        weights[..i]
+            .iter_mut()
+            .for_each(|w| *w *= BEFORE_CONTRAST_WEIGHT);
+    }
+    weights
+}
+
+fn is_resolved(toks: &[String], i: usize) -> bool {
+    let end = (i + RESOLVER_REACH + 1).min(toks.len());
+    RISKS.contains(&toks[i].as_str())
+        && toks[i.saturating_sub(RESOLVER_REACH)..end]
+            .iter()
+            .any(|t| RESOLVERS.contains(&t.as_str()))
+}
 
 fn tokens(text: &str) -> Vec<String> {
     text.to_lowercase()
@@ -63,6 +140,7 @@ fn tokens(text: &str) -> Vec<String> {
 impl NewsScorer for KeywordScorer {
     fn score(&self, headline: &str) -> f64 {
         let toks = tokens(headline);
+        let weights = clause_weights(&toks);
         let mut total = 0.0;
         let mut i = 0;
         while i < toks.len() {
@@ -78,10 +156,17 @@ impl NewsScorer for KeywordScorer {
                 .max_by_key(|h| h.0);
             match hit {
                 Some((n, w)) => {
-                    let negated = toks[i.saturating_sub(2)..i]
+                    let negated = toks[i.saturating_sub(NEGATION_REACH)..i]
                         .iter()
                         .any(|t| NEGATIONS.contains(&t.as_str()));
-                    total += if negated { -w } else { w };
+                    let signed = if is_resolved(&toks, i) {
+                        w.abs()
+                    } else if negated {
+                        -w
+                    } else {
+                        w
+                    };
+                    total += signed * weights[i];
                     i += n;
                 }
                 None => i += 1,
@@ -207,6 +292,54 @@ mod tests {
     fn phrases_take_priority_over_single_words() {
         let s = KeywordScorer;
         assert!(s.score("Maker cuts guidance") < s.score("Maker cuts"));
+    }
+
+    #[test]
+    fn resolved_legal_trouble_reads_as_good() {
+        let s = KeywordScorer;
+        assert!(s.score("Judge dismisses lawsuit against maker") > 0.0);
+        assert!(s.score("Investigation into maker closes with no charges") > 0.0);
+        assert!(s.score("Maker wins lawsuit over drilling rights") > 0.0);
+        assert!(s.score("Worker strike ends at maker") > 0.0);
+        assert!(s.score("Maker faces lawsuit") < 0.0);
+        assert!(s.score("Regulator opens probe into maker") < 0.0);
+    }
+
+    #[test]
+    fn cutting_a_burden_differs_from_cutting_an_outlook() {
+        let s = KeywordScorer;
+        assert!(s.score("Maker cuts debt") > 0.0);
+        assert!(s.score("Maker cuts costs") > 0.0);
+        assert!(s.score("Maker cuts guidance") < 0.0);
+        assert!(s.score("Maker cuts dividend") < 0.0);
+    }
+
+    #[test]
+    fn negation_reaches_past_small_words() {
+        assert!(KeywordScorer.score("Maker is not expected to miss") > 0.0);
+    }
+
+    #[test]
+    fn the_main_clause_outweighs_the_concession() {
+        let s = KeywordScorer;
+        assert!(s.score("Shares fall despite record revenue") < 0.0);
+        assert!(s.score("Maker beats estimates but warns on outlook") < 0.0);
+    }
+
+    #[test]
+    fn evenly_mixed_results_cancel_out() {
+        assert_eq!(
+            KeywordScorer.score("Maker beat on profit, missed on revenue"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn beating_back_a_bid_is_not_an_earnings_beat() {
+        assert_eq!(
+            KeywordScorer.score("Maker beats back takeover attempt"),
+            0.0
+        );
     }
 
     #[test]
