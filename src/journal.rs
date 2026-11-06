@@ -7,6 +7,7 @@ use crate::csv::{quote, Row, Table};
 use crate::data::{Market, OptionQuote};
 use crate::dates::parse_ts;
 use crate::exits::Reason;
+use crate::fetch::HeldLeg;
 use crate::pricing::Right;
 use crate::risk::{Book, Hedge, OpenPosition};
 use crate::selection::COMMISSION_PER_SHARE;
@@ -274,6 +275,30 @@ fn mark(id: usize, r: &Row, market: &Market, today: i64) -> Result<OpenTrade, St
         t.pnl = exit_value.map(|v| t.pnl_at(v, t.hedge_exit));
     }
     Ok(t)
+}
+
+/// The exact contracts in open trades, so a fetch always keeps them priced even
+/// after the stock has moved away from them.
+pub fn held_legs(path: &Path) -> Result<Vec<HeldLeg>, String> {
+    let mut out = Vec::new();
+    if !path.exists() {
+        return Ok(out);
+    }
+    let exits = load_exits(&exits_path(path))?;
+    for (i, r) in Table::read(path)?.iter().enumerate() {
+        if exits.contains_key(&(i + 1)) {
+            continue;
+        }
+        let entry_day = parse_ts(r.get("as_of")?).ok_or_else(|| r.err("bad as_of date"))? / 86400;
+        let legs = parse_legs(r.get("legs")?).ok_or_else(|| r.err("could not read legs"))?;
+        out.extend(legs.iter().map(|l| HeldLeg {
+            ticker: r.get("ticker").unwrap_or_default().to_string(),
+            expiry_day: entry_day + l.days,
+            strike: l.strike,
+            right: l.right,
+        }));
+    }
+    Ok(out)
 }
 
 pub fn load(path: &Path, market: &Market) -> Result<Ledger, String> {

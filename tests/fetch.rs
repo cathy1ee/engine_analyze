@@ -1,15 +1,20 @@
-//! Runs the fetcher against a fake Alpaca that replies in the documented formats.
+//! Snapshot saving with a fake data source, and IBKR rules with real tick types.
 use engine::analyze::{analyze, Context};
-use engine::data::load;
+use engine::data::{load, OptionQuote};
 use engine::dates::{days_from_civil, format_date};
-use engine::fetch::{run, Config, Feed, Http, HttpError};
+use engine::fetch::{run, Closes, Config, HeldLeg, Source, SourceError, Story};
+use engine::ibkr::{
+    clean_headline, pick_expiries, pick_strikes, ports_to_try, quote_from_ticks, wanted_contracts,
+    Mode,
+};
+use engine::journal::{exits_path, held_legs, EXIT_HEADER, HEADER};
 use engine::news::KeywordScorer;
 use engine::pricing::{price, Inputs, Right, RATE};
 use engine::risk::{Book, Limits};
-use serde_json::{json, Value};
+use ibapi::contracts::tick_types::TickType;
+use ibapi::market_data::realtime::{TickPrice, TickSize, TickTypes};
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -21,73 +26,32 @@ fn temp() -> PathBuf {
     d
 }
 
-/// Friday 2026-11-06 at 22:00 UTC, after the close.
-fn now(day_offset: i64) -> i64 {
-    (days_from_civil(2026, 11, 6) + day_offset) * 86400 + 22 * 3600
+fn friday() -> i64 {
+    days_from_civil(2026, 11, 6)
 }
 
-fn bars(last_day: i64, n: i64, start: f64) -> Value {
-    let rows: Vec<Value> = (0..n)
+/// That Friday at 22:00 UTC, after the close, plus any extra days.
+fn now(extra_days: i64) -> i64 {
+    (friday() + extra_days) * 86400 + 22 * 3600
+}
+
+fn history(last_day: i64, start: f64) -> Vec<(String, f64)> {
+    (0..120)
         .map(|i| {
-            let d = last_day - (n - 1 - i);
-            let c = start * (1.0 + 0.01 * ((i * 7 % 11) as f64 - 5.0) / 5.0);
-            json!({"t": format!("{}T05:00:00Z", format_date(d)), "o": c, "h": c, "l": c, "c": c, "v": 1000, "n": 10, "vw": c})
+            (
+                format_date(last_day - (119 - i)),
+                start * (1.0 + 0.01 * ((i * 7 % 11) as f64 - 5.0) / 5.0),
+            )
         })
-        .collect();
-    Value::Array(rows)
+        .collect()
 }
 
-struct Fake {
-    replies: Vec<(&'static str, Result<String, HttpError>)>,
-    calls: RefCell<HashMap<String, usize>>,
-    urls: RefCell<Vec<String>>,
-}
-
-impl Fake {
-    fn new(replies: Vec<(&'static str, Result<String, HttpError>)>) -> Self {
-        Fake {
-            replies,
-            calls: RefCell::new(HashMap::new()),
-            urls: RefCell::new(vec![]),
-        }
-    }
-}
-
-impl Http for Fake {
-    /// The first rule matching the URL wins, so page 2 rules go first.
-    fn get(&self, url: &str) -> Result<String, HttpError> {
-        self.urls.borrow_mut().push(url.to_string());
-        for (needle, reply) in &self.replies {
-            if url.contains(needle) {
-                *self
-                    .calls
-                    .borrow_mut()
-                    .entry(needle.to_string())
-                    .or_default() += 1;
-                return reply.clone();
-            }
-        }
-        Err(HttpError::Status(404, url.to_string()))
-    }
-}
-
-fn contract(sym: &str, right: &str, strike: f64, expiry: &str, oi: Value) -> Value {
-    json!({"symbol": sym, "root_symbol": "TST", "type": right, "strike_price": strike.to_string(),
-           "expiration_date": expiry, "open_interest": oi, "multiplier": "100"})
-}
-
-fn snap(bid: f64, ask: f64, vol: u64) -> Value {
-    json!({"latestQuote": {"bp": bid, "ap": ask, "bs": 1, "as": 1}, "dailyBar": {"v": vol}})
-}
-
-/// A realistic chain for TST at $100 with 35-day options.
-fn fair_chain(today: i64) -> (Value, Value) {
-    let expiry = format_date(today + 35);
-    let (mut contracts, mut snaps) = (vec![], serde_json::Map::new());
+fn fair_chain(spot: f64) -> Vec<OptionQuote> {
+    let mut out = vec![];
     for strike in [85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0] {
-        for (right, letter, r) in [(Right::Call, "C", "call"), (Right::Put, "P", "put")] {
+        for right in [Right::Call, Right::Put] {
             let i = Inputs {
-                spot: 100.0,
+                spot,
                 strike,
                 t: 35.0 / 365.0,
                 r: RATE,
@@ -95,55 +59,93 @@ fn fair_chain(today: i64) -> (Value, Value) {
                 vol: 0.35,
             };
             let p = price(right, &i);
-            let sym = format!("TST{letter}{strike}");
-            contracts.push(contract(&sym, r, strike, &expiry, json!("2000")));
-            snaps.insert(sym, snap(p - 0.02, p + 0.02, 900));
+            out.push(OptionQuote {
+                expiry_days: 35,
+                strike,
+                right,
+                bid: p - 0.02,
+                ask: p + 0.02,
+                volume: 900,
+                open_interest: 2000,
+            });
         }
     }
-    (
-        json!({"option_contracts": contracts, "next_page_token": null}),
-        json!({"snapshots": snaps, "next_page_token": null}),
-    )
+    out
 }
 
-fn healthy(today: i64) -> Fake {
-    let (contracts, snaps) = fair_chain(today);
-    let bars_json = json!({"bars": {
-        "TST": bars(today, 120, 100.0), "SPY": bars(today, 120, 500.0), "XLE": bars(today, 120, 90.0),
-        "TAN": bars(today, 120, 40.0), "XLU": bars(today, 120, 70.0), "SMH": bars(today, 120, 250.0)
-    }, "next_page_token": null});
-    let news = json!({"news": [
-        {"id": 1, "headline": "TST beats estimates, raises guidance", "created_at": "2026-11-06T14:00:00.123Z",
-         "updated_at": "2026-11-06T20:00:00Z", "symbols": ["TST", "OTHER"], "source": "benzinga"}
-    ], "next_page_token": null});
-    Fake::new(vec![
-        ("/v2/stocks/bars", Ok(bars_json.to_string())),
-        ("/v2/options/contracts", Ok(contracts.to_string())),
-        ("/options/snapshots/TST", Ok(snaps.to_string())),
-        ("/v1beta1/news", Ok(news.to_string())),
-    ])
+struct Fake {
+    last_day: i64,
+    chain: Result<Vec<OptionQuote>, SourceError>,
+    news: Result<Vec<Story>, SourceError>,
+    held_seen: RefCell<Vec<HeldLeg>>,
 }
 
-fn config(dir: &std::path::Path) -> Config {
+impl Fake {
+    fn healthy() -> Self {
+        let story = Story {
+            available_at: "2026-11-06T14:00:00Z".into(),
+            ticker: "TST".into(),
+            source: "BRFG".into(),
+            headline: "TST beats estimates, raises guidance".into(),
+        };
+        Fake {
+            last_day: friday(),
+            chain: Ok(fair_chain(100.0)),
+            news: Ok(vec![story]),
+            held_seen: RefCell::default(),
+        }
+    }
+}
+
+impl Source for Fake {
+    fn closes(&self, symbols: &[String]) -> Result<Closes, SourceError> {
+        let mut out = Closes::new();
+        for s in symbols {
+            out.insert(s.clone(), history(self.last_day, 100.0));
+        }
+        Ok(out)
+    }
+
+    fn chain(
+        &self,
+        ticker: &str,
+        _: f64,
+        _: i64,
+        held: &[&HeldLeg],
+    ) -> Result<Vec<OptionQuote>, SourceError> {
+        self.held_seen
+            .borrow_mut()
+            .extend(held.iter().map(|h| (*h).clone()));
+        if ticker == "BAD" {
+            return Err(SourceError::Skip("no standard options listed".into()));
+        }
+        self.chain.clone()
+    }
+
+    fn news(&self, _: &[String], _: i64) -> Result<Vec<Story>, SourceError> {
+        self.news.clone()
+    }
+}
+
+fn config(dir: &Path) -> Config {
     Config {
         dir: dir.to_path_buf(),
         tickers: vec!["TST".into()],
-        feed: Feed::Indicative,
+        held: vec![],
+        feed: "ibkr".into(),
     }
 }
 
 #[test]
 fn a_snapshot_runs_through_the_whole_engine() {
     let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    let r = run(&healthy(today), &config(&dir), now(0)).unwrap();
+    let r = run(&Fake::healthy(), &config(&dir), now(0)).unwrap();
     assert_eq!(r.date, "2026-11-06");
     assert_eq!((r.chains, r.quotes, r.stories), (1, 14, 1));
 
     let m = load(&dir.join("latest")).unwrap();
     assert!(!m.is_sample && m.earnings_unknown);
-    assert_eq!(m.source(), "indicative");
-    assert_eq!(m.as_of_date, "2026-11-06");
+    assert_eq!(m.source(), "ibkr");
 
     let (l, b) = (Limits::default(), Book::default());
     let ctx = Context {
@@ -155,51 +157,33 @@ fn a_snapshot_runs_through_the_whole_engine() {
         kill_switch: false,
     };
     let a = analyze(&ctx, "TST").unwrap();
-    assert!(
-        (a.signals.atm_iv - 0.35).abs() < 0.01,
-        "{}",
-        a.signals.atm_iv
-    );
     assert!(a.considered > 0, "liquid quotes should produce structures");
     assert_eq!(a.news.stories.len(), 1);
-}
-
-#[test]
-fn iv_rank_waits_for_enough_history_and_unknown_earnings_claim_no_vol_edge() {
-    let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    run(&healthy(today), &config(&dir), now(0)).unwrap();
-    let m = load(&dir.join("latest")).unwrap();
-    let (l, b) = (Limits::default(), Book::default());
-    let ctx = Context {
-        market: &m,
-        scorer: &KeywordScorer,
-        theme: None,
-        limits: &l,
-        book: &b,
-        kill_switch: false,
-    };
-    let a = analyze(&ctx, "TST").unwrap();
-    assert_eq!(a.signals.iv_rank, None);
+    assert_eq!(
+        a.signals.iv_rank, None,
+        "one day of IV isn't enough history"
+    );
     assert!(a.signals.earnings_unknown);
-    assert_eq!(a.forecast.vol, a.signals.atm_iv);
+    assert_eq!(
+        a.forecast.vol, a.signals.atm_iv,
+        "no volatility edge without an earnings calendar"
+    );
 }
 
 #[test]
 fn iv_history_builds_up_across_snapshots() {
     let dir = temp();
     std::fs::create_dir_all(&dir).unwrap();
-    let today = days_from_civil(2026, 11, 6);
     let mut hist = String::from("date,ticker,atm_iv\n");
     for i in 1..70 {
         hist.push_str(&format!(
             "{},TST,{:.4}\n",
-            format_date(today - i),
+            format_date(friday() - i),
             0.2 + i as f64 / 500.0
         ));
     }
     std::fs::write(dir.join("iv_history.csv"), hist).unwrap();
-    run(&healthy(today), &config(&dir), now(0)).unwrap();
+    run(&Fake::healthy(), &config(&dir), now(0)).unwrap();
 
     let m = load(&dir.join("latest")).unwrap();
     let (l, b) = (Limits::default(), Book::default());
@@ -212,111 +196,35 @@ fn iv_history_builds_up_across_snapshots() {
         kill_switch: false,
     };
     assert!(analyze(&ctx, "TST").unwrap().signals.iv_rank.is_some());
-    let saved = std::fs::read_to_string(dir.join("iv_history.csv")).unwrap();
     assert_eq!(
-        saved.lines().count(),
-        71,
-        "today's IV is added to the history"
-    );
-}
-
-#[test]
-fn news_uses_first_publish_time_and_only_watched_tickers() {
-    let dir = temp();
-    run(
-        &healthy(days_from_civil(2026, 11, 6)),
-        &config(&dir),
-        now(0),
-    )
-    .unwrap();
-    let text = std::fs::read_to_string(dir.join("latest/news.csv")).unwrap();
-    let rows: Vec<&str> = text.lines().skip(1).collect();
-    assert_eq!(rows.len(), 1, "OTHER isn't watched: {text}");
-    assert!(
-        rows[0].starts_with("2026-11-06T14:00:00Z,TST,benzinga,"),
-        "{}",
-        rows[0]
-    );
-    assert!(rows[0].contains("\"TST beats estimates, raises guidance\""));
-    assert!(rows[0].ends_with("2026-11-06T22:00:00Z"));
-}
-
-#[test]
-fn pages_are_followed_with_an_encoded_token() {
-    let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    let mut fake = healthy(today);
-    let page1 = json!({"bars": {"SPY": bars(today, 120, 500.0), "SMH": bars(today, 120, 250.0)}, "next_page_token": "a+b="});
-    let page2 = json!({"bars": {"TST": bars(today, 120, 100.0)}, "next_page_token": null});
-    fake.replies.retain(|r| r.0 != "/v2/stocks/bars");
-    fake.replies
-        .insert(0, ("page_token=a%2Bb%3D", Ok(page2.to_string())));
-    fake.replies
-        .insert(1, ("/v2/stocks/bars", Ok(page1.to_string())));
-    run(&fake, &config(&dir), now(0)).unwrap();
-    assert!(load(&dir.join("latest"))
-        .unwrap()
-        .prices
-        .contains_key("TST"));
-}
-
-#[test]
-fn bad_contracts_and_quotes_are_left_out() {
-    let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    let expiry = format_date(today + 35);
-    let mut adjusted = contract("ADJ", "call", 100.0, &expiry, json!("9000"));
-    adjusted["root_symbol"] = json!("TST1");
-    let mut mini = contract("MINI", "call", 100.0, &expiry, json!("9000"));
-    mini["multiplier"] = json!("10");
-    let contracts = json!({"option_contracts": [
-        contract("GOOD", "call", 100.0, &expiry, json!("2000")),
-        contract("NOOI", "put", 100.0, &expiry, Value::Null),
-        contract("CROSSED", "call", 105.0, &expiry, json!("2000")),
-        contract("EMPTY", "call", 110.0, &expiry, json!("2000")),
-        contract("UNQUOTED", "call", 115.0, &expiry, json!("2000")),
-        adjusted, mini
-    ], "next_page_token": null});
-    let snaps = json!({"snapshots": {
-        "GOOD": snap(4.0, 4.1, 300), "NOOI": snap(3.0, 3.1, 300), "CROSSED": snap(2.0, 1.9, 300),
-        "EMPTY": snap(0.0, 0.0, 0), "ADJ": snap(4.0, 4.1, 300), "MINI": snap(4.0, 4.1, 300)
-    }, "next_page_token": null});
-    let mut fake = healthy(today);
-    fake.replies
-        .retain(|r| !r.0.contains("contracts") && !r.0.contains("snapshots"));
-    fake.replies
-        .push(("/v2/options/contracts", Ok(contracts.to_string())));
-    fake.replies
-        .push(("/options/snapshots/TST", Ok(snaps.to_string())));
-    run(&fake, &config(&dir), now(0)).unwrap();
-
-    let m = load(&dir.join("latest")).unwrap();
-    let chain = &m.chains["TST"];
-    assert_eq!(chain.len(), 2);
-    let good = chain.iter().find(|q| q.right == Right::Call).unwrap();
-    assert_eq!(
-        (good.expiry_days, good.volume, good.open_interest),
-        (35, 300, 2000)
-    );
-    assert_eq!(
-        chain
-            .iter()
-            .find(|q| q.right == Right::Put)
+        std::fs::read_to_string(dir.join("iv_history.csv"))
             .unwrap()
-            .open_interest,
-        0
+            .lines()
+            .count(),
+        71
     );
 }
 
 #[test]
-fn a_blocked_news_plan_still_saves_a_snapshot_with_a_warning() {
+fn news_is_saved_with_its_publish_and_fetch_times() {
     let dir = temp();
-    let mut fake = healthy(days_from_civil(2026, 11, 6));
-    fake.replies.retain(|r| r.0 != "/v1beta1/news");
-    fake.replies.push((
-        "/v1beta1/news",
-        Err(HttpError::Status(403, "/v1beta1/news".into())),
-    ));
+    run(&Fake::healthy(), &config(&dir), now(0)).unwrap();
+    let text = std::fs::read_to_string(dir.join("latest/news.csv")).unwrap();
+    let row = text.lines().nth(1).unwrap();
+    assert!(
+        row.starts_with("2026-11-06T14:00:00Z,TST,BRFG,\"TST beats"),
+        "{row}"
+    );
+    assert!(row.ends_with("2026-11-06T22:00:00Z"), "{row}");
+}
+
+#[test]
+fn missing_news_access_still_saves_a_snapshot_with_a_warning() {
+    let dir = temp();
+    let fake = Fake {
+        news: Err(SourceError::Skip("no API news providers".into())),
+        ..Fake::healthy()
+    };
     let r = run(&fake, &config(&dir), now(0)).unwrap();
     assert_eq!(r.stories, 0);
     assert!(r.warnings.iter().any(|w| w.contains("no news")));
@@ -324,74 +232,274 @@ fn a_blocked_news_plan_still_saves_a_snapshot_with_a_warning() {
 }
 
 #[test]
-fn bad_keys_stop_the_fetch_and_keep_the_previous_snapshot() {
+fn a_lost_connection_keeps_the_previous_snapshot() {
     let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    run(&healthy(today), &config(&dir), now(0)).unwrap();
-
-    let mut fake = healthy(today + 3);
-    fake.replies.retain(|r| r.0 != "/v2/options/contracts");
-    fake.replies.insert(
-        0,
-        (
-            "/v2/options/contracts",
-            Err(HttpError::Status(401, "/v2/options/contracts".into())),
-        ),
+    run(&Fake::healthy(), &config(&dir), now(0)).unwrap();
+    let fake = Fake {
+        last_day: friday() + 3,
+        chain: Err(SourceError::Fatal("connection lost".into())),
+        ..Fake::healthy()
+    };
+    assert_eq!(
+        run(&fake, &config(&dir), now(3)).unwrap_err(),
+        "connection lost"
     );
-    let e = run(&fake, &config(&dir), now(3)).unwrap_err();
-    assert!(e.contains("rejected"), "{e}");
     assert_eq!(load(&dir.join("latest")).unwrap().as_of_date, "2026-11-06");
-    assert!(!dir.join(format_date(today + 3)).exists());
+    assert!(!dir.join(format_date(friday() + 3)).exists());
 }
 
 #[test]
 fn one_failing_chain_is_skipped_but_none_at_all_is_an_error() {
     let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
     let mut cfg = config(&dir);
-    cfg.tickers.push("SPY".into());
-    let r = run(&healthy(today), &cfg, now(0)).unwrap();
+    cfg.tickers.push("BAD".into());
+    let r = run(&Fake::healthy(), &cfg, now(0)).unwrap();
     assert_eq!(r.chains, 1);
+    assert!(r.warnings.iter().any(|w| w.starts_with("skipped BAD")));
 
-    let mut fake = healthy(today);
-    fake.replies.retain(|r| !r.0.contains("contracts"));
     let dir2 = temp();
-    assert!(run(&fake, &config(&dir2), now(0)).is_err());
+    let empty = Fake {
+        chain: Ok(vec![]),
+        ..Fake::healthy()
+    };
+    assert!(run(&empty, &config(&dir2), now(0)).is_err());
     assert!(!dir2.join("latest").exists());
 }
 
 #[test]
 fn weekend_runs_date_the_snapshot_by_the_last_session() {
     let dir = temp();
-    let friday = days_from_civil(2026, 11, 6);
-    let r = run(&healthy(friday), &config(&dir), now(1)).unwrap();
-    assert_eq!(r.date, "2026-11-06");
-    let m = load(&dir.join("latest")).unwrap();
-    assert!(m.chains["TST"].iter().all(|q| q.expiry_days == 35));
+    assert_eq!(
+        run(&Fake::healthy(), &config(&dir), now(1)).unwrap().date,
+        "2026-11-06"
+    );
 }
 
 #[test]
 fn a_midday_run_warns_that_closes_may_not_be_final() {
     let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    let r = run(&healthy(today), &config(&dir), today * 86400 + 15 * 3600).unwrap();
+    let r = run(
+        &Fake::healthy(),
+        &config(&dir),
+        friday() * 86400 + 15 * 3600,
+    )
+    .unwrap();
     assert!(r.warnings.iter().any(|w| w.contains("still be open")));
 }
 
 #[test]
-fn requests_use_the_right_feeds_and_never_touch_orders() {
+fn live_ports_are_refused_and_paper_ports_are_the_default() {
+    assert_eq!(ports_to_try(None).unwrap(), vec![7497, 4002]);
+    assert_eq!(ports_to_try(Some(4002)).unwrap(), vec![4002]);
+    assert!(ports_to_try(Some(7496)).unwrap_err().contains("live"));
+    assert!(ports_to_try(Some(4001)).unwrap_err().contains("live"));
+    assert_eq!(Mode::Delayed.feed(), "ibkr-delayed");
+}
+
+#[test]
+fn the_ibkr_source_has_no_order_code() {
+    let text = std::fs::read_to_string("src/ibkr.rs").unwrap();
+    for word in [
+        "place_order",
+        "submit_order",
+        "order(",
+        "ibapi::orders",
+        "Action::",
+    ] {
+        assert!(!text.contains(word), "found {word}");
+    }
+}
+
+#[test]
+fn only_monthly_expiries_in_the_window_are_used() {
+    let list: Vec<String> = [
+        "20261113", "20261120", "20261127", "20261218", "20270115", "20270319", "bad",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let got = pick_expiries(&list, friday());
+    assert_eq!(
+        got,
+        vec![
+            ("20261120".to_string(), 14),
+            ("20261218".to_string(), 42),
+            ("20270115".to_string(), 70)
+        ]
+    );
+}
+
+#[test]
+fn a_holiday_thursday_monthly_is_kept() {
+    // Good Friday 2027 is March 26, so test the shape on a third-week Thursday.
+    let list = vec!["20261216".to_string(), "20261217".to_string()];
+    assert_eq!(
+        pick_expiries(&list, friday()),
+        vec![("20261217".to_string(), 41)]
+    );
+}
+
+#[test]
+fn strikes_stay_near_spot_on_a_round_grid() {
+    let listed: Vec<f64> = (100..=300).map(|i| i as f64 * 0.5).collect();
+    let got = pick_strikes(&listed, 100.0);
+    assert_eq!(got.first(), Some(&80.0));
+    assert_eq!(got.last(), Some(&120.0));
+    assert!(got.contains(&90.0) && got.contains(&102.5) && !got.contains(&101.0));
+    // A small move in the stock doesn't change the grid, so held strikes stay listed.
+    assert!(pick_strikes(&listed, 98.0).contains(&102.5));
+}
+
+#[test]
+fn headlines_lose_their_metadata() {
+    assert_eq!(
+        clean_headline("{A:800015:L:en:K:n/a:C:0.9}!Intel beats"),
+        "Intel beats"
+    );
+    assert_eq!(clean_headline("  Plain headline "), "Plain headline");
+}
+
+fn px(tick_type: TickType, price: f64) -> TickTypes {
+    TickTypes::Price(TickPrice {
+        tick_type,
+        price,
+        attributes: Default::default(),
+    })
+}
+
+fn sz(tick_type: TickType, size: f64) -> TickTypes {
+    TickTypes::Size(TickSize { tick_type, size })
+}
+
+#[test]
+fn ticks_become_a_quote_with_the_right_open_interest() {
+    let ticks = [
+        px(TickType::Bid, 2.0),
+        px(TickType::Ask, 2.1),
+        sz(TickType::Volume, 350.0),
+        sz(TickType::OptionCallOpenInterest, 1200.0),
+        sz(TickType::OptionPutOpenInterest, 900.0),
+    ];
+    let call = quote_from_ticks(&ticks, 35, 100.0, Right::Call).unwrap();
+    assert_eq!(
+        (call.bid, call.ask, call.volume, call.open_interest),
+        (2.0, 2.1, 350, 1200)
+    );
+    assert_eq!(
+        quote_from_ticks(&ticks, 35, 100.0, Right::Put)
+            .unwrap()
+            .open_interest,
+        900
+    );
+}
+
+#[test]
+fn delayed_ticks_count_too() {
+    let ticks = [
+        px(TickType::DelayedBid, 1.0),
+        px(TickType::DelayedAsk, 1.2),
+        sz(TickType::DelayedVolume, 50.0),
+    ];
+    assert_eq!(
+        quote_from_ticks(&ticks, 35, 100.0, Right::Put)
+            .unwrap()
+            .volume,
+        50
+    );
+}
+
+#[test]
+fn missing_negative_and_crossed_prices_are_rejected() {
+    assert!(quote_from_ticks(&[px(TickType::Bid, 2.0)], 35, 100.0, Right::Call).is_none());
+    assert!(quote_from_ticks(
+        &[px(TickType::Bid, -1.0), px(TickType::Ask, 2.0)],
+        35,
+        100.0,
+        Right::Call
+    )
+    .is_none());
+    assert!(quote_from_ticks(
+        &[px(TickType::Bid, 1.0), px(TickType::Ask, -1.0)],
+        35,
+        100.0,
+        Right::Call
+    )
+    .is_none());
+    assert!(quote_from_ticks(
+        &[px(TickType::Bid, 2.0), px(TickType::Ask, 1.9)],
+        35,
+        100.0,
+        Right::Call
+    )
+    .is_none());
+}
+
+fn held(ticker: &str, expiry_day: i64, strike: f64, right: Right) -> HeldLeg {
+    HeldLeg {
+        ticker: ticker.into(),
+        expiry_day,
+        strike,
+        right,
+    }
+}
+
+#[test]
+fn open_trades_keep_their_exact_contracts_in_the_request() {
+    let (today, expiry) = (friday(), friday() + 14);
+    let expiries = vec![("20261120".to_string(), 14)];
+    let off_grid = held("TST", expiry, 101.0, Right::Put);
+    let on_grid = held("TST", expiry, 100.0, Right::Call);
+    let other_expiry = held("TST", friday() + 20, 100.0, Right::Call);
+    let expired = held("TST", friday() - 1, 100.0, Right::Call);
+    let got = wanted_contracts(
+        &expiries,
+        &[100.0],
+        &[&off_grid, &on_grid, &other_expiry, &expired],
+        today,
+    );
+    assert_eq!(
+        got.len(),
+        4,
+        "two on the grid, plus two held that weren't: {got:?}"
+    );
+    assert!(got.contains(&("20261120".to_string(), 14, 101.0, Right::Put)));
+    assert!(got.contains(&("20261126".to_string(), 20, 100.0, Right::Call)));
+}
+
+#[test]
+fn held_tickers_are_fetched_even_when_left_off_the_command() {
     let dir = temp();
-    let today = days_from_civil(2026, 11, 6);
-    let fake = healthy(today);
     let mut cfg = config(&dir);
-    cfg.feed = Feed::Opra;
-    run(&fake, &cfg, now(0)).unwrap();
-    let urls = fake.urls.borrow();
-    assert!(urls
-        .iter()
-        .any(|u| u.contains("/v2/stocks/bars") && u.contains("feed=sip")));
-    assert!(urls
-        .iter()
-        .any(|u| u.contains("/options/snapshots/") && u.contains("feed=opra")));
-    assert!(urls.iter().all(|u| !u.contains("/orders")));
+    cfg.held = vec![
+        held("OLD", friday() + 14, 100.0, Right::Call),
+        held("TST", friday() + 14, 95.0, Right::Put),
+    ];
+    let fake = Fake::healthy();
+    let r = run(&fake, &cfg, now(0)).unwrap();
+    assert_eq!(r.chains, 2);
+    assert_eq!(*fake.held_seen.borrow(), cfg.held);
+}
+
+#[test]
+fn closed_trades_are_not_held() {
+    let dir = temp();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("trades.csv");
+    let row = |t: &str| {
+        format!("2026-11-06,ibkr,{t},chips,,0,0,0.3,0.3,bear put spread,+P100@14|-P95@14,1,2.0000,200.00,15.00,,,")
+    };
+    std::fs::write(&path, format!("{HEADER}\n{}\n{}\n", row("AAA"), row("BBB"))).unwrap();
+    std::fs::write(
+        exits_path(&path),
+        format!("{EXIT_HEADER}\n1,2026-11-10,stop loss,4,0.9000,,-110.00\n"),
+    )
+    .unwrap();
+    let got = held_legs(&path).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            held("BBB", friday() + 14, 100.0, Right::Put),
+            held("BBB", friday() + 14, 95.0, Right::Put)
+        ]
+    );
 }

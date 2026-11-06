@@ -16,5 +16,5 @@ path = "src/main.rs"
 lto = true
 
 [dependencies]
-serde_json = "1.0.154"
-ureq = "2"
+ibapi = { version = "5.7.0", default-features = false, features = ["sync"] }
+time = "0.3.55"

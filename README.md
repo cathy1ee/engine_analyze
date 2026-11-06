@@ -67,13 +67,17 @@ On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in tota
 and new trades stop once open losses plus today's closed losses reach 2%.
 The account value used for these limits moves with realized PnL. Only defined-risk structures are built.
 
-## Using real data from Alpaca
+## Using real data from IBKR
 
-`engine fetch` only reads market data. It has no code that can place an order.
+`engine fetch` reads market data from TWS or IB Gateway on this Mac. It refuses
+IBKR's live ports and contains no order code.
 
-1. Create a free Alpaca paper account and generate API keys.
-2. Run `cp .env.example .env`, then add your keys to `.env`. Git ignores this file.
-3. After the market closes, run the daily routine:
+1. Install TWS or IB Gateway and log in to your **paper** account.
+2. In TWS, open Global Configuration, then API, then Settings. Turn on socket
+   connections and **Read-Only API**, and keep the socket port at 7497.
+3. For current prices, subscribe to market data on your live account and share it
+   with the paper account. Otherwise use `--delayed`.
+4. After the market closes, run the daily routine:
 
 ```bash
 cargo run --release -- fetch
@@ -86,17 +90,20 @@ newest. Snapshots stay out of Git because vendors usually restrict sharing their
 
 | Option | Effect |
 |---|---|
-| `fetch INTC AMD` | Fetches only those tickers, instead of the watchlist |
-| `fetch --feed opra` | Uses the full options feed, which needs a paid Alpaca plan |
+| `fetch INTC AMD` | Fetches only those tickers, plus anything held in open trades |
+| `fetch --delayed` | Uses free delayed data, and every report shows a warning |
+| `fetch --port 4002` | Connects on a specific paper port; 7497 and 4002 are tried by default |
 
-The free `indicative` feed has modified quotes, so the engine shows a warning and
-journals the source. Treat its edge and fills as a plumbing test, not a result.
+To stay under IBKR's 100 market data lines, options are requested 40 at a time, so
+a full watchlist takes a few minutes. Only monthly expiries and strikes within 20%
+of the stock are fetched, plus the exact contracts in any open trade.
 
 - **IV rank** shows `n/a` until 60 days of snapshots have built up.
 - **Earnings dates** aren't supplied, so the engine assumes no volatility edge for
   those stocks rather than risk ignoring an earnings jump.
-- **News** uses each story's first publish time. Anything after the close appears in
-  the next snapshot, because the option quotes in this one came before it.
+- **News** comes from the providers your account can use through the API, and uses
+  each story's publish time. Anything after the close appears in the next snapshot,
+  because the option quotes in this one came before it.
 
 ## Using other data
 
@@ -124,4 +131,4 @@ Point `--data` at a folder containing these CSV files:
 - Themes only tag news and journal rows. They do not change forecasts.
 - There is no backtester yet, because it needs historical options data.
 - Earnings dates have no live source yet.
-- The fetcher has been tested against documented reply formats and Alpaca's login check, not yet with real keys.
+- The IBKR connection itself has not been run against a real TWS or IB Gateway yet.

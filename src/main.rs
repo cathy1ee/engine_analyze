@@ -2,7 +2,8 @@ use engine::analyze::{analyze, Analysis, Context};
 use engine::broker::{Broker, CloseOrder, Order, PaperBroker};
 use engine::data::{self, Market};
 use engine::exits::{self, ExitRules};
-use engine::fetch::{self, AlpacaHttp, Feed};
+use engine::fetch;
+use engine::ibkr::{Ibkr, Mode};
 use engine::journal::{self, ClosedTrade, Entry, Ledger};
 use engine::news::KeywordScorer;
 use engine::risk::{Decision, Limits};
@@ -20,12 +21,13 @@ USAGE:
   engine scan [--theme NAME] [--data DIR] [--journal FILE]
   engine exits [--paper] [--data DIR] [--journal FILE]
   engine positions [--data DIR] [--journal FILE]
-  engine fetch [TICKERS...] [--feed indicative|opra] [--data DIR]
+  engine fetch [TICKERS...] [--delayed] [--port N] [--data DIR] [--journal FILE]
   engine gen-sample [--data DIR] [--seed N] [--advance DAYS]
 
   --paper   record the approved trade or the exits in the paper journal
   --advance write a snapshot this many trading days later, to simulate time
-  --feed    Alpaca options feed: indicative is free, opra needs a paid plan
+  --delayed use IBKR's free delayed data instead of a paid subscription
+  --port    TWS or IB Gateway paper port; 7497 and 4002 are tried by default
   --data    data folder, e.g. data/live/latest after running fetch
   --theme   tag news and journal rows with a theme, e.g. blue-wave
 
@@ -41,7 +43,8 @@ struct Args {
     journal: Option<PathBuf>,
     seed: Option<u64>,
     advance: usize,
-    feed: Option<String>,
+    delayed: bool,
+    port: Option<u16>,
 }
 
 fn parse(raw: &[String]) -> Result<Args, String> {
@@ -51,7 +54,8 @@ fn parse(raw: &[String]) -> Result<Args, String> {
         let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "--paper" => a.paper = true,
-            "--feed" => a.feed = Some(value()?),
+            "--delayed" => a.delayed = true,
+            "--port" => a.port = Some(value()?.parse().map_err(|_| "--port needs a port number")?),
             "--theme" => a.theme = Some(value()?),
             "--data" => a.data = Some(value()?.into()),
             "--journal" => a.journal = Some(value()?.into()),
@@ -77,8 +81,10 @@ fn parse(raw: &[String]) -> Result<Args, String> {
 fn sample_banner(m: &Market) {
     if m.is_sample {
         println!("*** SAMPLE DATA: invented prices and news, not real market information ***\n");
-    } else if m.feed.as_deref() == Some("indicative") {
-        println!("*** INDICATIVE FEED: option quotes are modified, so edge and fills are unreliable ***\n");
+    } else if m.feed.as_deref() == Some(Mode::Delayed.feed()) {
+        println!(
+            "*** DELAYED DATA: quotes are 15+ minutes old, so edge and fills are unreliable ***\n"
+        );
     }
 }
 
@@ -456,7 +462,11 @@ fn cmd_positions(a: &Args) -> Result<(), String> {
 }
 
 fn cmd_fetch(a: &Args) -> Result<(), String> {
-    let feed = Feed::parse(a.feed.as_deref().unwrap_or("indicative"))?;
+    let mode = if a.delayed {
+        Mode::Delayed
+    } else {
+        Mode::Subscribed
+    };
     let tickers: Vec<String> = if a.positional.len() > 1 {
         a.positional[1..].iter().map(|t| t.to_uppercase()).collect()
     } else {
@@ -468,26 +478,28 @@ fn cmd_fetch(a: &Args) -> Result<(), String> {
     {
         return Err(format!("'{bad}' is not a valid ticker"));
     }
-    let http = AlpacaHttp::new(fetch::load_keys(Path::new(".env"))?);
+    let source = Ibkr::connect(a.port, mode)?;
     let dir = a.data.clone().unwrap_or_else(|| "data/live".into());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs() as i64;
     println!(
-        "Fetching {} tickers from Alpaca ({} feed)...",
+        "Fetching {} tickers from IBKR ({}). This can take a few minutes...",
         tickers.len(),
-        feed.name()
+        mode.feed()
     );
-    let r = fetch::run(
-        &http,
-        &fetch::Config {
-            dir: dir.clone(),
-            tickers,
-            feed,
-        },
-        now,
-    )?;
+    let journal = a
+        .journal
+        .clone()
+        .unwrap_or_else(|| "journal/paper_trades.csv".into());
+    let cfg = fetch::Config {
+        dir: dir.clone(),
+        held: journal::held_legs(&journal)?,
+        tickers,
+        feed: mode.feed().to_string(),
+    };
+    let r = fetch::run(&source, &cfg, now)?;
     for w in &r.warnings {
         println!("warning: {w}");
     }
