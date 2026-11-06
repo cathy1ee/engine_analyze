@@ -202,6 +202,32 @@ pub fn quote_from_ticks(
     })
 }
 
+/// Collects news ticker by ticker, so one failure can't lose the rest. News only
+/// counts as unavailable when every ticker fails.
+pub fn gather_news(
+    tickers: &[String],
+    mut fetch: impl FnMut(&str) -> Result<Vec<Story>, String>,
+) -> Result<Vec<Story>, SourceError> {
+    let mut out = Vec::new();
+    let (mut worked, mut last_error) = (0, None);
+    for t in tickers {
+        match fetch(t) {
+            Ok(stories) => {
+                worked += 1;
+                out.extend(stories);
+            }
+            Err(e) => {
+                eprintln!("warning: no news for {t}: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+    match last_error {
+        Some(e) if worked == 0 => Err(SourceError::Skip(e)),
+        _ => Ok(out),
+    }
+}
+
 pub struct Ibkr {
     client: Client,
     contract_ids: RefCell<HashMap<String, i32>>,
@@ -399,24 +425,22 @@ impl Source for Ibkr {
                 .map_err(|e| skip("bad date", e))?,
             OffsetDateTime::now_utc(),
         );
-        let mut out = Vec::new();
-        for t in tickers {
-            let Ok(id) = self.contract_id(t) else {
-                continue;
-            };
+        gather_news(tickers, |t| {
+            let id = self.contract_id(t).map_err(|e| format!("{e:?}"))?;
             let articles = self
                 .client
                 .historical_news(id, &codes, start, end, NEWS_PER_TICKER)
-                .map_err(|e| skip("news request failed", e))?;
-            for a in articles.iter_data().filter_map(Result::ok) {
-                out.push(Story {
+                .map_err(|e| e.to_string())?;
+            Ok(articles
+                .iter_data()
+                .filter_map(Result::ok)
+                .map(|a| Story {
                     available_at: stamp(a.time.unix_timestamp()),
-                    ticker: t.clone(),
+                    ticker: t.to_string(),
                     source: a.provider_code.clone(),
                     headline: clean_headline(&a.headline),
-                });
-            }
-        }
-        Ok(out)
+                })
+                .collect())
+        })
     }
 }
