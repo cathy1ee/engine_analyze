@@ -26,7 +26,7 @@ pub struct Entry<'a> {
     pub hedge: Option<&'a Hedge>,
     pub theme: &'a str,
     pub as_of: &'a str,
-    pub is_sample: bool,
+    pub source: &'a str,
 }
 
 fn append_row(path: &Path, header: &str, cells: &[String]) -> Result<(), String> {
@@ -57,7 +57,7 @@ pub fn append(path: &Path, e: &Entry) -> Result<(), String> {
         .ok_or("nothing to journal: no trade selected")?;
     let cells = [
         e.as_of.to_string(),
-        if e.is_sample { "sample" } else { "market" }.to_string(),
+        e.source.to_string(),
         a.member.ticker.clone(),
         a.member.group.to_string(),
         e.theme.to_string(),

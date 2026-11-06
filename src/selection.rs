@@ -32,8 +32,9 @@ pub fn forecast(s: &Signals, n: &NewsSignal, days: Option<u32>) -> Forecast {
         || s.days_to_earnings
             .is_some_and(|e| e <= MAX_DAYS && days.is_none());
     // Realized vol says nothing about an earnings jump, so claim no volatility
-    // edge over the market when earnings fall inside the option's life.
-    let vol = if earnings_soon {
+    // edge over the market when earnings fall inside the option's life, or
+    // when there's no calendar to rule that out.
+    let vol = if earnings_soon || s.earnings_unknown {
         s.atm_iv
     } else {
         REALIZED_WEIGHT * s.realized_vol + (1.0 - REALIZED_WEIGHT) * s.atm_iv

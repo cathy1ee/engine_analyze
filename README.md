@@ -67,7 +67,38 @@ On a $100,000 paper account: 1% risk per trade, 4% per sector group, 10% in tota
 and new trades stop once open losses plus today's closed losses reach 2%.
 The account value used for these limits moves with realized PnL. Only defined-risk structures are built.
 
-## Using real data
+## Using real data from Alpaca
+
+`engine fetch` only reads market data. It has no code that can place an order.
+
+1. Create a free Alpaca paper account and generate API keys.
+2. Run `cp .env.example .env`, then add your keys to `.env`. Git ignores this file.
+3. After the market closes, run the daily routine:
+
+```bash
+cargo run --release -- fetch
+cargo run --release -- exits --paper --data data/live/latest
+cargo run --release -- scan --data data/live/latest
+```
+
+Each run saves a dated folder in `data/live`, and `data/live/latest` points to the
+newest. Snapshots stay out of Git because vendors usually restrict sharing their data.
+
+| Option | Effect |
+|---|---|
+| `fetch INTC AMD` | Fetches only those tickers, instead of the watchlist |
+| `fetch --feed opra` | Uses the full options feed, which needs a paid Alpaca plan |
+
+The free `indicative` feed has modified quotes, so the engine shows a warning and
+journals the source. Treat its edge and fills as a plumbing test, not a result.
+
+- **IV rank** shows `n/a` until 60 days of snapshots have built up.
+- **Earnings dates** aren't supplied, so the engine assumes no volatility edge for
+  those stocks rather than risk ignoring an earnings jump.
+- **News** uses each story's first publish time. Anything after the close appears in
+  the next snapshot, because the option quotes in this one came before it.
+
+## Using other data
 
 Point `--data` at a folder containing these CSV files:
 
@@ -92,3 +123,5 @@ Point `--data` at a folder containing these CSV files:
 - News scoring is a keyword baseline, and `NewsScorer` is where a better model plugs in.
 - Themes only tag news and journal rows. They do not change forecasts.
 - There is no backtester yet, because it needs historical options data.
+- Earnings dates have no live source yet.
+- The fetcher has been tested against documented reply formats and Alpaca's login check, not yet with real keys.

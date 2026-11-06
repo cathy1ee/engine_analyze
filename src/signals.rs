@@ -5,6 +5,7 @@ use crate::watchlist::{Member, BENCHMARK};
 use std::collections::HashMap;
 
 const YEAR: f64 = 252.0;
+pub const MIN_IV_HISTORY: usize = 60;
 
 #[derive(Clone, Debug)]
 pub struct Signals {
@@ -12,7 +13,8 @@ pub struct Signals {
     pub realized_vol: f64,
     pub atm_iv: f64,
     /// Where today's IV sits in its 1-year range: 0 = low, 1 = high.
-    pub iv_rank: f64,
+    /// `None` until there are MIN_IV_HISTORY days of IV to compare against.
+    pub iv_rank: Option<f64>,
     /// 10% OTM put IV minus 10% OTM call IV.
     pub skew: f64,
     /// ATM straddle price as a fraction of spot.
@@ -23,6 +25,8 @@ pub struct Signals {
     /// Last 5 days' return after removing market exposure.
     pub residual_5d: f64,
     pub days_to_earnings: Option<u32>,
+    /// True when the data has no earnings calendar, so a date may be missing.
+    pub earnings_unknown: bool,
 }
 
 pub fn stdev(xs: &[f64]) -> f64 {
@@ -91,6 +95,33 @@ fn nearest(chain: &[OptionQuote], expiry: u32, right: Right, strike: f64) -> Opt
         })
 }
 
+/// The expiry nearest 30 days with its at-the-money call, put and average IV.
+fn atm_quotes(chain: &[OptionQuote], spot: f64) -> Option<(u32, &OptionQuote, &OptionQuote, f64)> {
+    let expiry = chain
+        .iter()
+        .map(|q| q.expiry_days)
+        .min_by_key(|d| d.abs_diff(30))?;
+    let call = nearest(chain, expiry, Right::Call, spot)?;
+    let put = nearest(chain, expiry, Right::Put, spot)?;
+    let ivs: Vec<f64> = [call, put]
+        .iter()
+        .filter_map(|q| quote_iv(q, spot))
+        .collect();
+    if ivs.is_empty() {
+        return None;
+    }
+    Some((
+        expiry,
+        call,
+        put,
+        ivs.iter().sum::<f64>() / ivs.len() as f64,
+    ))
+}
+
+pub fn atm_iv(chain: &[OptionQuote], spot: f64) -> Option<f64> {
+    atm_quotes(chain, spot).map(|a| a.3)
+}
+
 pub fn compute(market: &Market, m: &Member) -> Result<Signals, String> {
     let rows = market
         .prices
@@ -116,24 +147,8 @@ pub fn compute(market: &Market, m: &Member) -> Result<Signals, String> {
     let rets: Vec<f64> = log_returns(rows).iter().map(|r| r.1).collect();
     let realized_vol = stdev(&rets[rets.len() - 20..]) * YEAR.sqrt();
 
-    let expiry = chain
-        .iter()
-        .map(|q| q.expiry_days)
-        .min_by_key(|d| d.abs_diff(30))
-        .ok_or_else(|| format!("empty option chain for {}", m.ticker))?;
-    let call = nearest(chain, expiry, Right::Call, spot).ok_or("chain has no calls")?;
-    let put = nearest(chain, expiry, Right::Put, spot).ok_or("chain has no puts")?;
-    let ivs: Vec<f64> = [call, put]
-        .iter()
-        .filter_map(|q| quote_iv(q, spot))
-        .collect();
-    if ivs.is_empty() {
-        return Err(format!(
-            "could not solve implied volatility for {}",
-            m.ticker
-        ));
-    }
-    let atm_iv = ivs.iter().sum::<f64>() / ivs.len() as f64;
+    let (expiry, call, put, atm_iv) = atm_quotes(chain, spot)
+        .ok_or_else(|| format!("could not solve implied volatility for {}", m.ticker))?;
 
     let hist: Vec<f64> = rows
         .iter()
@@ -145,11 +160,8 @@ pub fn compute(market: &Market, m: &Member) -> Result<Signals, String> {
     let (lo, hi) = hist
         .iter()
         .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
-    let iv_rank = if hi > lo {
-        ((atm_iv - lo) / (hi - lo)).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
+    let iv_rank = (hist.len() >= MIN_IV_HISTORY && hi > lo)
+        .then(|| ((atm_iv - lo) / (hi - lo)).clamp(0.0, 1.0));
 
     let skew = match (
         nearest(chain, expiry, Right::Put, spot * 0.9).and_then(|q| quote_iv(q, spot)),
@@ -187,6 +199,7 @@ pub fn compute(market: &Market, m: &Member) -> Result<Signals, String> {
         beta_sector,
         residual_5d,
         days_to_earnings: market.earnings_days.get(&m.ticker).copied(),
+        earnings_unknown: market.earnings_unknown && !market.earnings_days.contains_key(&m.ticker),
     })
 }
 

@@ -3,3 +3,4 @@
 KILL_SWITCH
 .DS_Store
 .env
+/data/live

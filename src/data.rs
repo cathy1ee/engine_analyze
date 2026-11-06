@@ -43,6 +43,10 @@ pub struct Market {
     pub as_of: i64,
     pub as_of_date: String,
     pub is_sample: bool,
+    /// Options feed named by the snapshot, such as `indicative` or `opra`.
+    pub feed: Option<String>,
+    /// True when the snapshot has no earnings calendar at all.
+    pub earnings_unknown: bool,
     pub prices: HashMap<String, Vec<PriceRow>>,
     pub chains: HashMap<String, Vec<OptionQuote>>,
     pub news: Vec<NewsItem>,
@@ -50,6 +54,15 @@ pub struct Market {
 }
 
 impl Market {
+    /// Where the data came from, as recorded in the journal.
+    pub fn source(&self) -> &str {
+        match (&self.feed, self.is_sample) {
+            (_, true) => "sample",
+            (Some(f), _) => f,
+            _ => "market",
+        }
+    }
+
     pub fn spot(&self, ticker: &str) -> Option<f64> {
         self.prices.get(ticker)?.last().map(|p| p.close)
     }
@@ -58,6 +71,10 @@ impl Market {
 pub fn load(dir: &Path) -> Result<Market, String> {
     let mut m = Market {
         is_sample: dir.join("SAMPLE_DATA").exists(),
+        feed: std::fs::read_to_string(dir.join("FEED"))
+            .ok()
+            .map(|f| f.trim().to_string()),
+        earnings_unknown: dir.join("EARNINGS_UNKNOWN").exists(),
         ..Market::default()
     };
 

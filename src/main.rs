@@ -2,6 +2,7 @@ use engine::analyze::{analyze, Analysis, Context};
 use engine::broker::{Broker, CloseOrder, Order, PaperBroker};
 use engine::data::{self, Market};
 use engine::exits::{self, ExitRules};
+use engine::fetch::{self, AlpacaHttp, Feed};
 use engine::journal::{self, ClosedTrade, Entry, Ledger};
 use engine::news::KeywordScorer;
 use engine::risk::{Decision, Limits};
@@ -9,7 +10,7 @@ use engine::sample;
 use engine::watchlist::{self, Theme, WATCHLIST};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "\
 Paper-only options engine
@@ -19,10 +20,13 @@ USAGE:
   engine scan [--theme NAME] [--data DIR] [--journal FILE]
   engine exits [--paper] [--data DIR] [--journal FILE]
   engine positions [--data DIR] [--journal FILE]
+  engine fetch [TICKERS...] [--feed indicative|opra] [--data DIR]
   engine gen-sample [--data DIR] [--seed N] [--advance DAYS]
 
   --paper   record the approved trade or the exits in the paper journal
   --advance write a snapshot this many trading days later, to simulate time
+  --feed    Alpaca options feed: indicative is free, opra needs a paid plan
+  --data    data folder, e.g. data/live/latest after running fetch
   --theme   tag news and journal rows with a theme, e.g. blue-wave
 
 Create a file named KILL_SWITCH in this folder to block all new trades.
@@ -37,6 +41,7 @@ struct Args {
     journal: Option<PathBuf>,
     seed: Option<u64>,
     advance: usize,
+    feed: Option<String>,
 }
 
 fn parse(raw: &[String]) -> Result<Args, String> {
@@ -46,6 +51,7 @@ fn parse(raw: &[String]) -> Result<Args, String> {
         let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "--paper" => a.paper = true,
+            "--feed" => a.feed = Some(value()?),
             "--theme" => a.theme = Some(value()?),
             "--data" => a.data = Some(value()?.into()),
             "--journal" => a.journal = Some(value()?.into()),
@@ -71,7 +77,14 @@ fn parse(raw: &[String]) -> Result<Args, String> {
 fn sample_banner(m: &Market) {
     if m.is_sample {
         println!("*** SAMPLE DATA: invented prices and news, not real market information ***\n");
+    } else if m.feed.as_deref() == Some("indicative") {
+        println!("*** INDICATIVE FEED: option quotes are modified, so edge and fills are unreliable ***\n");
     }
+}
+
+fn rank(s: &engine::signals::Signals) -> String {
+    s.iv_rank
+        .map_or("n/a".to_string(), |r| format!("{:.0}%", r * 100.0))
 }
 
 fn print_analysis(a: &Analysis, m: &Market, elapsed_ms: f64) {
@@ -82,10 +95,10 @@ fn print_analysis(a: &Analysis, m: &Market, elapsed_ms: f64) {
     );
     println!("\nVolatility");
     println!(
-        "  ATM IV {:.1}%   realized 20d {:.1}%   IV rank {:.0}%",
+        "  ATM IV {:.1}%   realized 20d {:.1}%   IV rank {}",
         s.atm_iv * 100.0,
         s.realized_vol * 100.0,
-        s.iv_rank * 100.0
+        rank(s)
     );
     println!(
         "  skew {:+.1} pts   implied move {:.1}%",
@@ -94,6 +107,9 @@ fn print_analysis(a: &Analysis, m: &Market, elapsed_ms: f64) {
     );
     match s.days_to_earnings {
         Some(d) => println!("  earnings in {d} days"),
+        None if s.earnings_unknown => {
+            println!("  earnings date unknown, so no volatility edge is assumed")
+        }
         None => println!("  no earnings date on file"),
     }
     println!("\nFactors (60 days)");
@@ -254,7 +270,7 @@ fn cmd_analyze(a: &Args) -> Result<(), String> {
                         hedge: hedge.as_ref(),
                         theme: a.theme.as_deref().unwrap_or(""),
                         as_of: &s.market.as_of_date,
-                        is_sample: s.market.is_sample,
+                        source: s.market.source(),
                     },
                 )?;
                 println!("Paper trade recorded in {}", s.journal.display());
@@ -296,11 +312,11 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
             Decision::Blocked(w) => format!("no trade: {w}"),
         };
         println!(
-            "{:<6} {:<11} {:>5.1}% {:>5.0}% {:>+6.2}  {:<25} {:>6}  {decision}",
+            "{:<6} {:<11} {:>5.1}% {:>6} {:>+6.2}  {:<25} {:>6}  {decision}",
             r.member.ticker,
             r.member.group,
             r.signals.atm_iv * 100.0,
-            r.signals.iv_rank * 100.0,
+            rank(&r.signals),
             r.news.direction,
             name,
             edge
@@ -439,12 +455,61 @@ fn cmd_positions(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_fetch(a: &Args) -> Result<(), String> {
+    let feed = Feed::parse(a.feed.as_deref().unwrap_or("indicative"))?;
+    let tickers: Vec<String> = if a.positional.len() > 1 {
+        a.positional[1..].iter().map(|t| t.to_uppercase()).collect()
+    } else {
+        WATCHLIST.iter().map(|m| m.0.to_string()).collect()
+    };
+    if let Some(bad) = tickers
+        .iter()
+        .find(|t| !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'))
+    {
+        return Err(format!("'{bad}' is not a valid ticker"));
+    }
+    let http = AlpacaHttp::new(fetch::load_keys(Path::new(".env"))?);
+    let dir = a.data.clone().unwrap_or_else(|| "data/live".into());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
+    println!(
+        "Fetching {} tickers from Alpaca ({} feed)...",
+        tickers.len(),
+        feed.name()
+    );
+    let r = fetch::run(
+        &http,
+        &fetch::Config {
+            dir: dir.clone(),
+            tickers,
+            feed,
+        },
+        now,
+    )?;
+    for w in &r.warnings {
+        println!("warning: {w}");
+    }
+    println!(
+        "Saved {} to {}: {} option chains, {} quotes, {} news rows",
+        r.date,
+        r.path.display(),
+        r.chains,
+        r.quotes,
+        r.stories
+    );
+    println!("Next: engine scan --data {}", dir.join("latest").display());
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let a = parse(&raw)?;
     match a.positional.first().map(String::as_str) {
         Some("analyze") => cmd_analyze(&a),
         Some("scan") => cmd_scan(&a),
+        Some("fetch") => cmd_fetch(&a),
         Some("exits") => cmd_exits(&a),
         Some("positions") => cmd_positions(&a),
         Some("gen-sample") => {

@@ -125,7 +125,7 @@ fn journal_feeds_back_into_risk_limits() {
         hedge: hedge.as_ref(),
         theme: "blue-wave",
         as_of: "2026-11-05",
-        is_sample: true,
+        source: "sample",
     };
     journal::append(&path, &entry).unwrap();
 

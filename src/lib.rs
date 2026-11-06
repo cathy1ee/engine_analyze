@@ -5,6 +5,7 @@ pub mod csv;
 pub mod data;
 pub mod dates;
 pub mod exits;
+pub mod fetch;
 pub mod journal;
 pub mod news;
 pub mod pricing;
