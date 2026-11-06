@@ -91,7 +91,7 @@ The account value used for these limits moves with realized PnL. Only defined-ri
 ## Using real data from IBKR
 
 `engine fetch` reads market data from TWS or IB Gateway on this Mac. It refuses
-IBKR's live ports and contains no order code.
+IBKR's live ports and live accounts, and contains no order code.
 
 1. Install TWS or IB Gateway and log in to your **paper** account.
 2. In TWS, open Global Configuration, then API, then Settings. Turn on socket
